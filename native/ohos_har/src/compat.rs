@@ -3,11 +3,11 @@
 //! RustDesk wire or authentication semantics.
 
 use hbb_common::config::Config;
-use napi_derive_ohos::napi;
-use napi_ohos::Result;
 use librustdesk::media_capability::{
     query_h264_hardware_decoder, query_hevc_hardware_capabilities, AdvertisedCodec, CapabilityError,
 };
+use napi_derive_ohos::napi;
+use napi_ohos::Result;
 use serde_json::{json, Value};
 
 const UNSUPPORTED_MESSAGE: &str = "Not implemented by RustDesk Enhanced";

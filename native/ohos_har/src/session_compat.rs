@@ -7,11 +7,16 @@ use hbb_common::{
     config::{keys::OPTION_KEY, Config, RS_PUB_KEY},
     sodiumoxide::crypto::sign,
 };
-use napi_derive_ohos::napi;
 use librustdesk::{
     rendezvous::RendezvousConfig,
-    viewer::{SurfaceLease, Viewer, ViewerImageQuality, ViewerKey, ViewerOptions, ViewerSnapshot},
+    session_backend::SessionBackend,
+    viewer::{
+        SurfaceLease, Viewer, ViewerError, ViewerImageQuality, ViewerKey, ViewerOptions,
+        ViewerSnapshot,
+    },
+    vnc::live::VncLiveSession,
 };
+use napi_derive_ohos::napi;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -24,10 +29,22 @@ use zeroize::Zeroizing;
 const DEFAULT_DIRECT_PORT: u16 = 21118;
 const MAX_COMPAT_SESSIONS: usize = 6;
 
-#[derive(Clone)]
+/// The protocol a session speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionProtocol {
+    RustDesk,
+    Vnc,
+}
+
+#[derive(Debug, Clone)]
 enum SessionRoute {
     Direct(SocketAddr),
     Rendezvous(String),
+    /// An RFB endpoint, from a `vnc://` target.
+    Vnc {
+        host: String,
+        port: u16,
+    },
 }
 
 struct DeferredSurfaceState {
@@ -118,7 +135,10 @@ struct CompatSession {
     show_remote_cursor: bool,
     disable_audio: bool,
     phase: String,
-    viewer: Option<Arc<Viewer>>,
+    /// Which protocol this session speaks. Decided from the target when the
+    /// session is created, because the two protocols cannot be told apart later.
+    protocol: SessionProtocol,
+    viewer: Option<Arc<SessionBackend>>,
     surface: Arc<DeferredSurfaceLease>,
     pending_events: VecDeque<Value>,
     last_engine_phase: String,
@@ -274,7 +294,40 @@ fn usb_hid_to_viewer_key(usb_hid: u32, character: &str) -> Option<ViewerKey> {
     librustdesk::viewer::usb_hid_key(usb_hid, character)
 }
 
+/// The RFB scheme, and the default port a VNC server listens on.
+const VNC_SCHEME: &str = "vnc://";
+const VNC_DEFAULT_PORT: u16 = 5900;
+
+/// The host and port of a `vnc://` target, or `None` for any other target.
+///
+/// The scheme is what distinguishes a VNC endpoint from a RustDesk peer id: an
+/// id is an opaque string, so a bare `10.0.0.1:5900` must stay a direct RustDesk
+/// address and not silently become VNC. The port defaults because writing
+/// `vnc://host` is the common case.
+fn parse_vnc_target(target: &str) -> Option<(String, u16)> {
+    let rest = target.strip_prefix(VNC_SCHEME)?;
+    if rest.is_empty() || rest.chars().any(char::is_control) {
+        return None;
+    }
+    // `SocketAddr` first so an IPv6 literal's brackets are handled by the parser
+    // rather than by splitting on the last colon.
+    if let Ok(address) = rest.parse::<SocketAddr>() {
+        return (address.port() != 0).then(|| (address.ip().to_string(), address.port()));
+    }
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (rest, VNC_DEFAULT_PORT),
+    };
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    Some((host.to_owned(), port))
+}
+
 fn parse_route(target: &str) -> Option<SessionRoute> {
+    if let Some((host, port)) = parse_vnc_target(target) {
+        return Some(SessionRoute::Vnc { host, port });
+    }
     if let Ok(address) = target.parse::<SocketAddr>() {
         return (address.port() != 0).then_some(SessionRoute::Direct(address));
     }
@@ -350,7 +403,15 @@ fn collect_engine_events(
             "text": if snapshot.phase == "awaiting_2fa_retry" { "Wrong 2FA Code" } else { "2FA Required" }
         }));
     }
-    if snapshot.phase == "authenticated" && !session.peer_info_emitted {
+    // A VNC session has no login exchange to authenticate: it is usable as soon
+    // as the handshake completes, which the snapshot reports as `connected` and
+    // then `streaming`. Waiting for an `authenticated` phase that RFB never
+    // produces would leave the frontend showing "connecting" forever.
+    let ready_for_peer_info = match session.protocol {
+        SessionProtocol::RustDesk => snapshot.phase == "authenticated",
+        SessionProtocol::Vnc => matches!(snapshot.phase.as_str(), "connected" | "streaming"),
+    };
+    if ready_for_peer_info && !session.peer_info_emitted {
         session.pending_events.push_back(json!({
             "name": "connection_ready",
             "secure": snapshot.encrypted.to_string(),
@@ -554,6 +615,7 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         show_remote_cursor: false,
         disable_audio: true,
         phase: "created".to_owned(),
+        protocol: SessionProtocol::RustDesk,
         viewer: None,
         surface: Arc::new(DeferredSurfaceLease::new()),
         pending_events: VecDeque::new(),
@@ -637,7 +699,7 @@ pub fn session_set_codec_preference(session_id: String, codec: String) -> String
 
 #[napi]
 pub fn session_start(session_id: String) -> String {
-    let (route, options, surface, force_relay) = {
+    let (route, options, surface, force_relay, mut password_for_vnc, view_only) = {
         let mut registry = lock(sessions());
         let Some(session) = registry.get_mut(&session_id) else {
             return action("session_start", false, "Session not found", None);
@@ -663,25 +725,33 @@ pub fn session_start(session_id: String) -> String {
         let options = ViewerOptions {
             address: match &session.route {
                 SessionRoute::Direct(address) => Some(*address),
-                SessionRoute::Rendezvous(_) => None,
+                SessionRoute::Rendezvous(_) | SessionRoute::Vnc { .. } => None,
             },
             username: match &session.route {
                 SessionRoute::Direct(address) => address.ip().to_string(),
                 SessionRoute::Rendezvous(id) => id.clone(),
+                SessionRoute::Vnc { host, port } => format!("{host}:{port}"),
             },
             local_id,
             local_name: "RustDesk HMOS".to_owned(),
-            password: std::mem::take(&mut *session.password),
+            // The password is carried separately: a VNC session uses it during
+            // the handshake and a RustDesk session later, so it cannot be moved
+            // into these options.
+            password: String::new(),
             requested_fps: session.requested_fps,
             clipboard_enabled: session.clipboard_enabled,
             image_quality: quality,
         };
         session.phase = "starting".to_owned();
+        let password = std::mem::take(&mut *session.password);
+        let view_only = session.view_only;
         (
             session.route.clone(),
             options,
             session.surface.clone(),
             session.force_relay,
+            password,
+            view_only,
         )
     };
     if force_relay {
@@ -694,10 +764,24 @@ pub fn session_start(session_id: String) -> String {
             session,
         );
     }
-    let viewer = match route {
-        SessionRoute::Direct(_) => Viewer::start(options, surface),
+    let viewer: Result<Arc<SessionBackend>, ViewerError> = match route {
+        // A VNC server authenticates during the handshake, so the connection
+        // (and therefore the password) is used here and now. There is no later
+        // step at which a password could be supplied.
+        SessionRoute::Vnc { host, port } => {
+            let password = std::mem::take(&mut password_for_vnc);
+            let password = (!password.is_empty()).then_some(password.as_str());
+            match VncLiveSession::open(&host, port, password, !view_only) {
+                Ok(session) => Ok(Arc::new(SessionBackend::Vnc(Arc::new(session)))),
+                Err(error) => Err(ViewerError::Vnc(error)),
+            }
+        }
+        SessionRoute::Direct(_) => {
+            Viewer::start(options, surface).map(|viewer| Arc::new(SessionBackend::RustDesk(viewer)))
+        }
         SessionRoute::Rendezvous(id) => match rendezvous_config(id) {
-            Ok(config) => Viewer::start_rendezvous(options, surface, config),
+            Ok(config) => Viewer::start_rendezvous(options, surface, config)
+                .map(|viewer| Arc::new(SessionBackend::RustDesk(viewer))),
             Err(message) => {
                 let registry = lock(sessions());
                 return action("session_start", false, message, registry.get(&session_id));
@@ -712,12 +796,18 @@ pub fn session_start(session_id: String) -> String {
         return action("session_start", false, "Session was removed", None);
     };
     match viewer {
-        Ok(viewer) => {
-            session.viewer = Some(viewer);
+        Ok(backend) => {
+            let protocol = backend.protocol();
+            session.protocol = if backend.is_vnc() {
+                SessionProtocol::Vnc
+            } else {
+                SessionProtocol::RustDesk
+            };
+            session.viewer = Some(backend);
             action(
                 "session_start",
                 true,
-                "RustDesk Enhanced viewer started",
+                &format!("{protocol} session started"),
                 Some(session),
             )
         }
@@ -1824,17 +1914,64 @@ pub fn session_take_clipboard_image(session_id: String) -> Vec<u8> {
     Vec::new()
 }
 
+/// Bytes in one RGBA8888 frame the session hands out.
 #[napi]
-pub fn session_get_rgba_size(_session_id: String, _display: u32) -> u32 {
-    0
+pub fn session_get_rgba_size(session_id: String, display: u32) -> u32 {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return 0;
+    };
+    // Only a backend that produces raw pixels has a size to report; a RustDesk
+    // session decodes into a surface and has none.
+    let _ = display;
+    let Some(backend) = session.viewer.as_ref().filter(|backend| backend.is_vnc()) else {
+        return 0;
+    };
+    let snapshot = backend.snapshot();
+    if snapshot.width <= 0 || snapshot.height <= 0 {
+        return 0;
+    }
+    (snapshot.width as u32)
+        .saturating_mul(snapshot.height as u32)
+        .saturating_mul(4)
 }
 
+/// Ask the backend to prepare the next frame.
+///
+/// A VNC server pushes updates on its own, so there is nothing to request beyond
+/// the continuous stream the reader already maintains. The call exists so a
+/// frontend's poll loop does not need to know which backend it is talking to.
 #[napi]
-pub fn session_next_rgba(_session_id: String, _display: u32) {}
+pub fn session_next_rgba(session_id: String, display: u32) {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return;
+    };
+    let _ = display;
+    // Nothing to do: frames arrive when the server sends them.
+    let _ = session;
+}
 
+/// The newest RGBA8888 frame, or empty when there is nothing new.
+///
+/// Empty means "no new frame", not "a black frame": a frontend that redraws an
+/// unchanged picture at its polling rate wastes the work, so a taken frame is
+/// cleared until the server sends another.
 #[napi]
-pub fn session_take_rgba_frame(_session_id: String, _display: u32) -> Vec<u8> {
-    Vec::new()
+pub fn session_take_rgba_frame(session_id: String, display: u32) -> Vec<u8> {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return Vec::new();
+    };
+    if display != 0 {
+        return Vec::new();
+    }
+    session
+        .viewer
+        .as_ref()
+        .and_then(|backend| backend.take_raw_frame())
+        .map(|(_width, _height, pixels)| pixels)
+        .unwrap_or_default()
 }
 
 #[napi]

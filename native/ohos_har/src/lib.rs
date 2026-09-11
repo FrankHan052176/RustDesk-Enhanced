@@ -3,8 +3,6 @@
 mod compat;
 mod host_bridge;
 mod session_compat;
-use napi_derive_ohos::napi;
-use napi_ohos::{Error, Result, Status};
 use librustdesk::{
     media_capability::{
         self, AdvertisedCodec, CapabilityError, CodecDirection, ScreenCaptureRateEvidence,
@@ -12,6 +10,8 @@ use librustdesk::{
     rendezvous::RendezvousConfig,
     viewer::{SurfaceLease, Viewer, ViewerError, ViewerImageQuality, ViewerOptions},
 };
+use napi_derive_ohos::napi;
+use napi_ohos::{Error, Result, Status};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
