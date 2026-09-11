@@ -1,0 +1,7 @@
+.DS_Store
+target/
+**/target/
+dist/
+native/ohos_har/dist/
+native/ohos_har/package.har
+native/ohos_har/package/libs/
