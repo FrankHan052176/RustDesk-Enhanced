@@ -338,7 +338,20 @@ impl VncSession {
         self.stream
             .read_exact(&mut code)
             .map_err(|error| VncError::io("security result", error))?;
-        match u32::from_be_bytes(code) {
+        let big_endian = u32::from_be_bytes(code);
+        // RFC 6143 defines the result as a 32-bit big-endian word, and every
+        // server that follows it sends 0, 1 or 2 to mean success, failure or too
+        // many attempts. Some Apple screen-sharing servers instead put failure on
+        // the wire as 01 00 00 00, which is the failure code in the other byte
+        // order; that value is not a legal big-endian result, so accepting it
+        // cannot mask a conforming server's answer. Only that one byte pattern is
+        // tolerated -- a general byte-swap fallback would hide real corruption.
+        let value = if big_endian == u32::from_le_bytes([0, 0, 0, SECURITY_RESULT_FAILED as u8]) {
+            SECURITY_RESULT_FAILED
+        } else {
+            big_endian
+        };
+        match value {
             SECURITY_RESULT_OK => Ok(()),
             SECURITY_RESULT_FAILED => Err(VncError::AuthenticationRejected(
                 "server rejected the password".to_owned(),
@@ -350,7 +363,7 @@ impl VncSession {
                 Err(VncError::AuthenticationRejected(reason))
             }
             other => Err(VncError::protocol(format!(
-                "unknown security result {other}"
+                "unknown security result {other} (bytes {code:02x?})"
             ))),
         }
     }
@@ -693,6 +706,37 @@ mod tests {
         let (host, port) = address.split_once(':').expect("host:port");
         let error = VncSession::connect_with_password(host, port.parse().expect("port"), "bad")
             .unwrap_err();
+        assert!(
+            matches!(error, VncError::AuthenticationRejected(_)),
+            "{error}"
+        );
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn a_failure_code_in_the_other_byte_order_is_still_a_refusal() {
+        let (address, server) = run_against_script(|mut stream| {
+            stream.write_all(b"RFB 003.008\n").expect("banner");
+            let mut answer = [0u8; 12];
+            stream.read_exact(&mut answer).expect("version answer");
+            stream.write_all(&[1, 2]).expect("security list");
+            let mut choice = [0u8; 1];
+            stream.read_exact(&mut choice).expect("choice");
+            stream.write_all(&[0u8; 16]).expect("challenge");
+            let mut response = [0u8; 16];
+            stream.read_exact(&mut response).expect("response");
+            // Apple screen sharing sends failure as 01 00 00 00.
+            stream.write_all(&[0x01, 0x00, 0x00, 0x00]).expect("result");
+            let reason = b"Authentication failure";
+            stream
+                .write_all(&(reason.len() as u32).to_be_bytes())
+                .expect("reason length");
+            stream.write_all(reason).expect("reason");
+        });
+
+        let (host, port) = address.split_once(':').expect("host:port");
+        let error =
+            VncSession::connect_with_password(host, port.parse().expect("port"), "pw").unwrap_err();
         assert!(
             matches!(error, VncError::AuthenticationRejected(_)),
             "{error}"
