@@ -1,5 +1,6 @@
 //! Modern-only HAR. src/lib.rs is an uncompiled historical reference.
 //! No legacy application initialization, protocol implementation or pixel path.
+mod compat;
 mod host_bridge;
 use napi_derive_ohos::napi;
 use napi_ohos::{Error, Result, Status};
