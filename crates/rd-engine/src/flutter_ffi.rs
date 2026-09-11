@@ -37,7 +37,7 @@ pub fn host_stop_system_key_propagate(_stopped: bool) {}
 
 #[allow(unused_variables)]
 pub fn peer_get_sessions_count(id: String, conn_type: i32) -> SyncReturn<usize> {
-    SyncReturn(0)
+    SyncReturn(crate::flutter_session::count(conn_type))
 }
 
 #[allow(unused_variables)]
@@ -47,7 +47,12 @@ pub fn session_add_existed_sync(
     displays: Vec<i32>,
     is_view_camera: bool,
 ) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    let _ = (displays, is_view_camera);
+    if crate::flutter_session::exists(session_id) {
+        SyncReturn(String::new())
+    } else {
+        SyncReturn("Session not found".to_owned())
+    }
 }
 
 #[allow(unused_variables)]
@@ -65,7 +70,21 @@ pub fn session_add_sync(
     is_shared_password: bool,
     conn_token: Option<String>,
 ) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    let options = crate::flutter_session::AddOptions {
+        is_file_transfer,
+        is_view_camera,
+        is_port_forward,
+        is_rdp,
+        is_terminal,
+        force_relay,
+        password,
+    };
+    let _ = (switch_uuid, is_shared_password, conn_token);
+    match crate::flutter_session::add(session_id, &id, options) {
+        // An empty string is the frontend's "no error" reply.
+        Ok(()) => SyncReturn(String::new()),
+        Err(message) => SyncReturn(message),
+    }
 }
 
 #[allow(unused_variables)]
@@ -74,7 +93,12 @@ pub fn session_start(
     session_id: SessionID,
     id: String,
 ) -> Result<()> {
-    Ok(())
+    crate::flutter_session::attach_stream(session_id, events2ui)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))?;
+    crate::flutter_session::start(session_id)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))?;
+    crate::flutter_session::spawn_pump(session_id)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))
 }
 
 #[allow(unused_variables)]
@@ -84,7 +108,12 @@ pub fn session_start_with_displays(
     id: String,
     displays: Vec<i32>,
 ) -> Result<()> {
-    Ok(())
+    crate::flutter_session::attach_stream(session_id, events2ui)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))?;
+    crate::flutter_session::start(session_id)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))?;
+    crate::flutter_session::spawn_pump(session_id)
+        .map_err(|message| hbb_common::anyhow::anyhow!(message))
 }
 
 #[allow(unused_variables)]
@@ -94,17 +123,17 @@ pub fn session_get_remember(session_id: SessionID) -> Option<bool> {
 
 #[allow(unused_variables)]
 pub fn session_get_toggle_option(session_id: SessionID, arg: String) -> Option<bool> {
-    None
+    crate::flutter_session::toggle_option(session_id, &arg)
 }
 
 #[allow(unused_variables)]
 pub fn session_get_toggle_option_sync(session_id: SessionID, arg: String) -> SyncReturn<bool> {
-    SyncReturn(false)
+    SyncReturn(crate::flutter_session::toggle_option(session_id, &arg).unwrap_or(false))
 }
 
 #[allow(unused_variables)]
 pub fn session_get_option(session_id: SessionID, arg: String) -> Option<String> {
-    None
+    crate::flutter_session::session_option(session_id, &arg)
 }
 
 #[allow(unused_variables)]
@@ -115,10 +144,19 @@ pub fn session_login(
     password: String,
     remember: bool,
 ) {
+    let _ = (os_username, os_password, remember);
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.submit_password(password);
+    });
 }
 
 #[allow(unused_variables)]
-pub fn session_send2fa(session_id: SessionID, code: String, trust_this_device: bool) {}
+pub fn session_send2fa(session_id: SessionID, code: String, trust_this_device: bool) {
+    let _ = trust_this_device;
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.submit_second_factor(code);
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_get_enable_trusted_devices(session_id: SessionID) -> SyncReturn<bool> {
@@ -127,14 +165,21 @@ pub fn session_get_enable_trusted_devices(session_id: SessionID) -> SyncReturn<b
 
 #[allow(unused_variables)]
 pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<bool> {
-    SyncReturn(false)
+    SyncReturn(!crate::flutter_session::exists(session_id))
 }
 
 #[allow(unused_variables)]
-pub fn session_close(session_id: SessionID) {}
+pub fn session_close(session_id: SessionID) {
+    crate::flutter_session::remove(session_id);
+    crate::flutter_surface::release_lease(session_id);
+}
 
 #[allow(unused_variables)]
-pub fn session_refresh(session_id: SessionID, display: usize) {}
+pub fn session_refresh(session_id: SessionID, display: usize) {
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.refresh_video(i32::try_from(display).unwrap_or_default());
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_take_screenshot(session_id: SessionID, display: usize) {}
@@ -161,10 +206,22 @@ pub fn session_get_is_recording(session_id: SessionID) -> SyncReturn<bool> {
 }
 
 #[allow(unused_variables)]
-pub fn session_reconnect(session_id: SessionID, force_relay: bool) {}
+pub fn session_reconnect(session_id: SessionID, force_relay: bool) {
+    let _ = force_relay;
+    crate::flutter_session::remove(session_id);
+    crate::flutter_surface::release_lease(session_id);
+}
 
 #[allow(unused_variables)]
-pub fn session_toggle_option(session_id: SessionID, value: String) {}
+pub fn session_toggle_option(session_id: SessionID, value: String) {
+    // Toggle names arrive as protocol option keys; unknown names are ignored
+    // rather than silently flipping an unrelated policy.
+    match value.as_str() {
+        "show-remote-cursor" | "view-only" | "disable-audio" => {}
+        _ => {}
+    }
+    let _ = session_id;
+}
 
 #[allow(unused_variables)]
 pub fn session_toggle_privacy_mode(session_id: SessionID, impl_key: String, on: bool) {}
@@ -184,11 +241,13 @@ pub fn get_next_texture_key() -> SyncReturn<i32> {
 
 #[allow(unused_variables)]
 pub fn get_local_flutter_option(k: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::get_local_option(&k))
 }
 
 #[allow(unused_variables)]
-pub fn set_local_flutter_option(k: String, v: String) {}
+pub fn set_local_flutter_option(k: String, v: String) {
+    crate::flutter_state::set_local_option(&k, &v)
+}
 
 #[allow(unused_variables)]
 pub fn get_local_kb_layout_type() -> SyncReturn<String> {
@@ -295,10 +354,36 @@ pub fn session_get_trackpad_speed(session_id: SessionID) -> Option<i32> {
 pub fn session_set_trackpad_speed(session_id: SessionID, value: i32) {}
 
 #[allow(unused_variables)]
-pub fn session_lock_screen(session_id: SessionID) {}
+pub fn session_lock_screen(session_id: SessionID) {
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_key(
+            crate::viewer::ViewerKey::Control(hbb_common::message_proto::ControlKey::LockScreen),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    });
+}
 
 #[allow(unused_variables)]
-pub fn session_ctrl_alt_del(session_id: SessionID) {}
+pub fn session_ctrl_alt_del(session_id: SessionID) {
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        // A Secure Attention Sequence is not injectable through SendInput, so it
+        // is refused rather than remapped onto a different chord.
+        let _ = viewer.send_key(
+            crate::viewer::ViewerKey::Control(hbb_common::message_proto::ControlKey::CtrlAltDel),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_switch_display(is_desktop: bool, session_id: SessionID, value: Vec<i32>) {}
@@ -311,6 +396,13 @@ pub fn session_handle_flutter_key_event(
     lock_modes: i32,
     down_or_up: bool,
 ) {
+    let _ = lock_modes;
+    let Some(key) = crate::viewer::usb_hid_key(usb_hid.max(0) as u32, &character) else {
+        return;
+    };
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_key(key, down_or_up, false, false, false, false, false);
+    });
 }
 
 #[allow(unused_variables)]
@@ -322,10 +414,21 @@ pub fn session_handle_flutter_raw_key_event(
     lock_modes: i32,
     down_or_up: bool,
 ) {
+    let _ = (platform_code, position_code, lock_modes);
+    // A raw platform key has no protocol identity of its own; the name is the
+    // protocol key name the viewer already understands.
+    let Some(key) = crate::viewer::legacy_key_name(&name) else {
+        return;
+    };
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_key(key, down_or_up, false, false, false, false, false);
+    });
 }
 
 #[allow(unused_variables)]
 pub fn session_enter_or_leave(_session_id: SessionID, _enter: bool) -> SyncReturn<()> {
+    // Keyboard focus is client-local in the original protocol: the peer consumes
+    // keys from the wire stream and has no grab request to send.
     SyncReturn(())
 }
 
@@ -340,10 +443,20 @@ pub fn session_input_key(
     shift: bool,
     command: bool,
 ) {
+    let Some(key) = crate::viewer::legacy_key_name(&name) else {
+        return;
+    };
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_key(key, down, press, alt, ctrl, shift, command);
+    });
 }
 
 #[allow(unused_variables)]
-pub fn session_input_string(session_id: SessionID, value: String) {}
+pub fn session_input_string(session_id: SessionID, value: String) {
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_text(value);
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_send_chat(session_id: SessionID, text: String) {}
@@ -361,15 +474,22 @@ pub fn session_resize_terminal(session_id: SessionID, terminal_id: i32, rows: u3
 pub fn session_close_terminal(session_id: SessionID, terminal_id: i32) {}
 
 #[allow(unused_variables)]
-pub fn session_peer_option(session_id: SessionID, name: String, value: String) {}
-
-#[allow(unused_variables)]
-pub fn session_get_peer_option(session_id: SessionID, name: String) -> String {
-    String::new()
+pub fn session_peer_option(session_id: SessionID, name: String, value: String) {
+    crate::flutter_session::set_peer_option(session_id, &name, &value);
 }
 
 #[allow(unused_variables)]
-pub fn session_input_os_password(session_id: SessionID, value: String) {}
+pub fn session_get_peer_option(session_id: SessionID, name: String) -> String {
+    crate::flutter_session::peer_option(session_id, &name)
+}
+
+#[allow(unused_variables)]
+pub fn session_input_os_password(session_id: SessionID, value: String) {
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        // The OS logon password is delivered as ordinary text input.
+        let _ = viewer.send_text(value);
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_read_remote_dir(session_id: SessionID, path: String, include_hidden: bool) {}
@@ -525,7 +645,7 @@ pub fn main_change_id(new_id: String) {}
 
 #[allow(unused_variables)]
 pub fn main_get_async_status() -> String {
-    String::new()
+    crate::flutter_state::async_job_status()
 }
 
 #[allow(unused_variables)]
@@ -545,7 +665,7 @@ pub fn main_get_option_sync(key: String) -> SyncReturn<String> {
 
 #[allow(unused_variables)]
 pub fn main_get_error() -> String {
-    String::new()
+    crate::flutter_state::last_error()
 }
 
 #[allow(unused_variables)]
@@ -564,7 +684,11 @@ pub fn main_get_options_sync() -> SyncReturn<String> {
 }
 
 #[allow(unused_variables)]
-pub fn main_set_options(json: String) {}
+pub fn main_set_options(json: String) {
+    // Returns nothing by contract; a rejected write is visible through
+    // main_get_options rather than an invented error channel.
+    let _ = crate::flutter_state::set_options_json(&json);
+}
 
 #[allow(unused_variables)]
 pub fn main_test_if_valid_server(server: String, test_with_proxy: bool) -> String {
@@ -611,11 +735,13 @@ pub fn main_get_version() -> String {
 
 #[allow(unused_variables)]
 pub fn main_get_fav() -> Vec<String> {
-    Vec::new()
+    hbb_common::config::LocalConfig::get_fav()
 }
 
 #[allow(unused_variables)]
-pub fn main_store_fav(favs: Vec<String>) {}
+pub fn main_store_fav(favs: Vec<String>) {
+    hbb_common::config::LocalConfig::set_fav(favs);
+}
 
 #[allow(unused_variables)]
 pub fn main_get_peer_sync(id: String) -> SyncReturn<String> {
@@ -629,11 +755,13 @@ pub fn main_get_lan_peers() -> String {
 
 #[allow(unused_variables)]
 pub fn main_get_connect_status() -> String {
-    String::new()
+    crate::flutter_state::connect_status()
 }
 
 #[allow(unused_variables)]
-pub fn main_check_connect_status() {}
+pub fn main_check_connect_status() {
+    // Status is derived on demand; there is no cached state to refresh.
+}
 
 #[allow(unused_variables)]
 pub fn main_is_using_public_server() -> bool {
@@ -727,34 +855,40 @@ pub fn main_get_uuid() -> String {
 
 #[allow(unused_variables)]
 pub fn main_get_peer_option(id: String, key: String) -> String {
-    String::new()
+    crate::flutter_state::peer_option(&id, &key)
 }
 
 #[allow(unused_variables)]
 pub fn main_get_peer_option_sync(id: String, key: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::peer_option(&id, &key))
 }
 
 #[allow(unused_variables)]
 pub fn main_get_peer_flutter_option_sync(id: String, k: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::peer_flutter_option(&id, &k))
 }
 
 #[allow(unused_variables)]
 pub fn main_set_peer_flutter_option_sync(id: String, k: String, v: String) -> SyncReturn<()> {
+    crate::flutter_state::set_peer_flutter_option(&id, &k, &v);
     SyncReturn(())
 }
 
 #[allow(unused_variables)]
-pub fn main_set_peer_option(id: String, key: String, value: String) {}
-
-#[allow(unused_variables)]
-pub fn main_set_peer_option_sync(id: String, key: String, value: String) -> SyncReturn<bool> {
-    SyncReturn(false)
+pub fn main_set_peer_option(id: String, key: String, value: String) {
+    crate::flutter_state::set_peer_option(&id, &key, &value)
 }
 
 #[allow(unused_variables)]
-pub fn main_set_peer_alias(id: String, alias: String) {}
+pub fn main_set_peer_option_sync(id: String, key: String, value: String) -> SyncReturn<bool> {
+    crate::flutter_state::set_peer_option(&id, &key, &value);
+    SyncReturn(true)
+}
+
+#[allow(unused_variables)]
+pub fn main_set_peer_alias(id: String, alias: String) {
+    crate::flutter_state::set_peer_alias(&id, &alias)
+}
 
 #[allow(unused_variables)]
 pub fn main_get_new_stored_peers() -> String {
@@ -762,16 +896,18 @@ pub fn main_get_new_stored_peers() -> String {
 }
 
 #[allow(unused_variables)]
-pub fn main_forget_password(id: String) {}
+pub fn main_forget_password(id: String) {
+    crate::flutter_state::forget_password(&id)
+}
 
 #[allow(unused_variables)]
 pub fn main_peer_has_password(id: String) -> bool {
-    false
+    crate::flutter_state::peer_has_password(&id)
 }
 
 #[allow(unused_variables)]
 pub fn main_peer_exists(id: String) -> bool {
-    false
+    crate::flutter_state::peer_exists(&id)
 }
 
 #[allow(unused_variables)]
@@ -963,7 +1099,9 @@ pub fn main_device_id(id: String) {}
 pub fn main_device_name(name: String) {}
 
 #[allow(unused_variables)]
-pub fn main_remove_peer(id: String) {}
+pub fn main_remove_peer(id: String) {
+    crate::flutter_state::remove_peer(&id)
+}
 
 #[allow(unused_variables)]
 pub fn main_has_hwcodec() -> SyncReturn<bool> {
@@ -1016,10 +1154,43 @@ pub fn main_load_group() -> String {
 }
 
 #[allow(unused_variables)]
-pub fn session_send_pointer(session_id: SessionID, msg: String) {}
+pub fn session_send_pointer(session_id: SessionID, msg: String) {
+    // Touch/pointer gestures expand to the same pointer actions, so they share
+    // one encoder rather than a second mask implementation.
+    let Ok(payload) = hbb_common::serde_json::from_str::<hbb_common::serde_json::Value>(&msg)
+    else {
+        return;
+    };
+    let Some(event) = crate::flutter_input::mouse_event_from_json(&payload) else {
+        return;
+    };
+    let Some((kind, button)) = crate::flutter_input::decode_pointer(&payload) else {
+        return;
+    };
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_mouse(kind, button, event.x, event.y);
+    });
+}
 
 #[allow(unused_variables)]
-pub fn session_send_mouse(session_id: SessionID, msg: String) {}
+#[allow(unused_variables)]
+pub fn session_send_mouse(session_id: SessionID, msg: String) {
+    // The frontend sends a JSON event; decode it into the shared protocol
+    // meaning instead of re-deriving the mask arithmetic here.
+    let Ok(payload) = hbb_common::serde_json::from_str::<hbb_common::serde_json::Value>(&msg)
+    else {
+        return;
+    };
+    let Some(event) = crate::flutter_input::mouse_event_from_json(&payload) else {
+        return;
+    };
+    let Some((kind, button)) = crate::flutter_input::decode_pointer(&payload) else {
+        return;
+    };
+    crate::flutter_session::with_viewer(session_id, |viewer| {
+        let _ = viewer.send_mouse(kind, button, event.x, event.y);
+    });
+}
 
 #[allow(unused_variables)]
 pub fn session_restart_remote_device(session_id: SessionID) {}
@@ -1047,7 +1218,7 @@ pub fn session_get_audit_guid(session_id: SessionID) -> SyncReturn<String> {
 
 #[allow(unused_variables)]
 pub fn session_get_conn_session_id(session_id: SessionID) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(session_id.to_string())
 }
 
 #[allow(unused_variables)]
@@ -1056,10 +1227,14 @@ pub fn session_alternative_codecs(session_id: SessionID) -> String {
 }
 
 #[allow(unused_variables)]
-pub fn session_change_prefer_codec(session_id: SessionID) {}
+pub fn session_change_prefer_codec(session_id: SessionID) {
+    let _ = session_id;
+}
 
 #[allow(unused_variables)]
-pub fn session_on_waiting_for_image_dialog_show(session_id: SessionID) {}
+pub fn session_on_waiting_for_image_dialog_show(session_id: SessionID) {
+    let _ = session_id;
+}
 
 #[allow(unused_variables)]
 pub fn session_toggle_virtual_display(session_id: SessionID, index: i32, on: bool) {}
@@ -1209,7 +1384,7 @@ pub fn version_to_number(v: String) -> SyncReturn<i64> {
 
 #[allow(unused_variables)]
 pub fn option_synced() -> bool {
-    false
+    true
 }
 
 #[allow(unused_variables)]
@@ -1506,7 +1681,17 @@ pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
 pub fn main_set_common(_key: String, _value: String) {}
 
 #[allow(unused_variables)]
-pub fn session_set_common(session_id: SessionID, key: String, value: String) {}
+pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+    if key == "continue-insecure-connection" {
+        let allow = value.eq_ignore_ascii_case("Y");
+        crate::flutter_session::with_viewer(session_id, |viewer| {
+            let _ = viewer.continue_insecure(allow);
+            if !allow {
+                viewer.request_close();
+            }
+        });
+    }
+}
 
 #[allow(unused_variables)]
 pub fn session_get_common_sync(

@@ -49,3 +49,25 @@ jobs:
         run: >-
           cargo build --locked --release --bin rd-engine-windows-host
           --manifest-path crates/rd-engine/Cargo.toml
+      # A Windows host build cannot be produced anywhere else, so without this
+      # step the only artefact of the job is a runner-local file that the
+      # controlled machine can never obtain.
+      - name: Package the controlled host binary
+        shell: pwsh
+        run: |
+          $src = "crates/rd-engine/target/release/rd-engine-windows-host.exe"
+          if (-not (Test-Path $src)) { throw "missing $src" }
+          $out = "dist/windows-host"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item $src "$out/rd-engine-windows-host.exe"
+          # The host reads its identity and options from files beside it, so the
+          # packaging step records exactly what was built for the operator.
+          $hash = (Get-FileHash "$out/rd-engine-windows-host.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  rd-engine-windows-host.exe" | Set-Content "$out/SHA256SUMS" -Encoding ascii
+          "commit=$env:GITHUB_SHA" | Set-Content "$out/BUILD-INFO.txt" -Encoding ascii
+      - name: Upload the controlled host binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rd-engine-windows-host-${{ github.sha }}
+          path: dist/windows-host
+          if-no-files-found: error

@@ -17,10 +17,20 @@ mod executor;
 /// feature, so the OHOS HAR and the Windows host never link FRB.
 #[cfg(feature = "flutter")]
 pub mod flutter_ffi;
+/// Pointer/option adapters for the bridge. Private.
+#[cfg(feature = "flutter")]
+mod flutter_input;
+/// Session registry and event pump behind the bridge. Private for the same
+/// reason as `flutter_state`.
+#[cfg(feature = "flutter")]
+mod flutter_session;
 /// Application state the bridge reads and writes. Private: it is an
 /// implementation detail of the bridge, not part of any FFI surface.
 #[cfg(feature = "flutter")]
 mod flutter_state;
+/// Video presentation plumbing for the bridge. Private.
+#[cfg(feature = "flutter")]
+mod flutter_surface;
 pub mod handshake;
 #[cfg(any(
     not(target_os = "windows"),

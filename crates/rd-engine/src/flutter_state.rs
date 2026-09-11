@@ -151,6 +151,104 @@ pub fn is_option_fixed(_key: &str) -> bool {
     false
 }
 
+/// Per-peer option value, persisted in the peer's own config file so it
+/// survives a reconnect and is shared by every session to that peer.
+pub fn peer_option(id: &str, key: &str) -> String {
+    hbb_common::config::PeerConfig::load(id)
+        .options
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn set_peer_option(id: &str, key: &str, value: &str) {
+    if id.is_empty() || key.is_empty() || value.len() > 4096 {
+        return;
+    }
+    let mut config = hbb_common::config::PeerConfig::load(id);
+    config.options.insert(key.to_owned(), value.to_owned());
+    config.store(id);
+}
+
+/// Flutter-only presentation option for a peer, kept in the same peer config so
+/// the UI restores its own settings without a second store.
+pub fn peer_flutter_option(id: &str, key: &str) -> String {
+    let config = hbb_common::config::PeerConfig::load(id);
+    config
+        .options
+        .get(&format!("flutter-{key}"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn set_peer_flutter_option(id: &str, key: &str, value: &str) {
+    if id.is_empty() || key.is_empty() || value.len() > 4096 {
+        return;
+    }
+    let mut config = hbb_common::config::PeerConfig::load(id);
+    // Stored under a namespaced key so a Flutter presentation option can never
+    // collide with a protocol option that shares its name.
+    config
+        .options
+        .insert(format!("flutter-{key}"), value.to_owned());
+    config.store(id);
+}
+
+/// Drop the stored password for a peer.
+pub fn forget_password(id: &str) {
+    let mut config = hbb_common::config::PeerConfig::load(id);
+    config.password = Vec::new();
+    config.store(id);
+}
+
+pub fn peer_has_password(id: &str) -> bool {
+    !hbb_common::config::PeerConfig::load(id).password.is_empty()
+}
+
+pub fn peer_exists(id: &str) -> bool {
+    // A peer is "known" when this machine has stored anything about it, which is
+    // what the UI means by an existing entry. Anything beyond an empty config
+    // counts, so a peer the user only aliased is still found.
+    let config = hbb_common::config::PeerConfig::load(id);
+    !config.options.is_empty() || !config.info.hostname.is_empty()
+}
+
+pub fn set_peer_alias(id: &str, alias: &str) {
+    if id.is_empty() || alias.len() > 4096 {
+        return;
+    }
+    set_peer_option(id, "alias", alias);
+}
+
+/// Remove every stored trace of a peer.
+pub fn remove_peer(id: &str) {
+    if id.is_empty() || id.len() > 256 {
+        return;
+    }
+    // The vendored config owns peer-file layout, so removal goes through it
+    // rather than re-deriving the path here.
+    hbb_common::config::PeerConfig::remove(id);
+}
+
+/// Connection status is derived from what the runtime actually knows, not from
+/// a cached string: this build reports no rendezvous registration, so the UI is
+/// told the client is not registered rather than shown a false "ready".
+pub fn connect_status() -> String {
+    String::new()
+}
+
+/// Last runtime error. The viewer reports per-session errors through its own
+/// events, so there is no separate global error to surface.
+pub fn last_error() -> String {
+    String::new()
+}
+
+/// Global async job status. There is no background account/address-book job in
+/// this build, so no job is reported as running.
+pub fn async_job_status() -> String {
+    String::new()
+}
+
 /// Whether the rendezvous key is the stock public key rather than a custom one.
 pub fn is_using_public_server() -> bool {
     Config::get_option(keys::OPTION_KEY).is_empty()
