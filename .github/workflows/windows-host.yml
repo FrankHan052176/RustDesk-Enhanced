@@ -27,9 +27,22 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
+  # Runs everywhere, including on a machine with no Dart toolchain, so a stale
+  # committed binding is caught before it reaches the job that cannot rebuild it.
+  bindings:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the committed bridge covers the FFI surface
+        run: python3 scripts/flutter/verify-committed-bridge.py
+
   windows-host:
     runs-on: windows-2022
     timeout-minutes: 40
+    needs: bindings
     steps:
       - uses: actions/checkout@v4
         with:

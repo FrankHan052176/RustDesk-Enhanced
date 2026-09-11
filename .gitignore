@@ -6,13 +6,19 @@ native/ohos_har/dist/
 native/ohos_har/package.har
 native/ohos_har/package/libs/
 
-# Flutter Rust bridge codegen output. Regenerate with
-# scripts/flutter/generate-bridge.sh; the Dart side consumes the package that
-# the same script produces, and neither is a source of truth.
-crates/rd-engine/src/bridge_generated.rs
-crates/rd-engine/src/bridge_generated.io.rs
-crates/rd-engine/flutter_bridge/generated_bridge.dart
+# Flutter Rust bridge codegen output.
+#
+# The bindings are committed on purpose. They are derived from
+# `crates/rd-engine/src/flutter_ffi.rs` by scripts/flutter/generate-bridge.sh,
+# but `flutter_rust_bridge_codegen` needs a full Dart toolchain and every job
+# that has to compile this crate runs without one -- the Windows host build
+# today, the Flutter shells next. While these were ignored, `cargo fmt` failed
+# first, because rustfmt resolves every `mod` regardless of enabled features, so
+# the crate could not be formatted, tested or built anywhere that had not
+# already run codegen by hand.
+#
+# After any change to `flutter_ffi.rs`, rerun scripts/flutter/generate-bridge.sh
+# and commit the regenerated bindings in the same change.
 crates/rd-engine/flutter_bridge/generated_bridge.freezed.dart
-crates/rd-engine/flutter_bridge/bridge_generated.h
 crates/rd-engine/flutter_bridge/.dart_tool/
 crates/rd-engine/.dart_tool/
