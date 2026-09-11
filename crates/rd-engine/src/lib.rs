@@ -57,6 +57,7 @@ pub mod publisher;
 ))]
 #[path = "platform/windows_host_publisher.rs"]
 pub mod publisher;
+pub mod rdp;
 pub mod rendezvous;
 pub mod session;
 /// One interface over the protocols a session can speak (RustDesk, VNC).

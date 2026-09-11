@@ -376,6 +376,8 @@ pub enum ViewerError {
     Decoder(DecoderError),
     /// A VNC session failed or refused an operation; the text says which.
     Vnc(crate::vnc::VncError),
+    /// An RDP session failed or is not implemented yet.
+    Rdp(crate::rdp::RdpError),
 }
 impl fmt::Display for ViewerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -384,6 +386,7 @@ impl fmt::Display for ViewerError {
         match self {
             Self::Decoder(error) => write!(f, "Surface decoder: {error:?}"),
             Self::Vnc(error) => write!(f, "{error}"),
+            Self::Rdp(error) => write!(f, "{error}"),
             other => write!(f, "{other:?}"),
         }
     }

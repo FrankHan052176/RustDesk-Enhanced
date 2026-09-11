@@ -34,14 +34,17 @@ const MAX_COMPAT_SESSIONS: usize = 6;
 enum SessionProtocol {
     RustDesk,
     Vnc,
+    /// RDP: parsed so a target naming it is understood, but not yet connectable.
+    Rdp,
 }
 
 #[derive(Debug, Clone)]
 enum SessionRoute {
     Direct(SocketAddr),
     Rendezvous(String),
-    /// An RFB endpoint, from a `vnc://` target.
-    Vnc {
+    /// A remote-desktop endpoint named by a scheme: RFB or RDP.
+    Scheme {
+        protocol: SessionProtocol,
         host: String,
         port: u16,
     },
@@ -294,39 +297,52 @@ fn usb_hid_to_viewer_key(usb_hid: u32, character: &str) -> Option<ViewerKey> {
     librustdesk::viewer::usb_hid_key(usb_hid, character)
 }
 
-/// The RFB scheme, and the default port a VNC server listens on.
+/// The remote-desktop schemes this client can be pointed at, and the port each
+/// protocol's server listens on by default.
 const VNC_SCHEME: &str = "vnc://";
 const VNC_DEFAULT_PORT: u16 = 5900;
+const RDP_SCHEME: &str = "rdp://";
+const RDP_DEFAULT_PORT: u16 = 3389;
 
-/// The host and port of a `vnc://` target, or `None` for any other target.
+/// The host and port of a target that names a remote-desktop scheme.
 ///
-/// The scheme is what distinguishes a VNC endpoint from a RustDesk peer id: an
+/// The scheme is what distinguishes such an endpoint from a RustDesk peer id: an
 /// id is an opaque string, so a bare `10.0.0.1:5900` must stay a direct RustDesk
 /// address and not silently become VNC. The port defaults because writing
 /// `vnc://host` is the common case.
-fn parse_vnc_target(target: &str) -> Option<(String, u16)> {
-    let rest = target.strip_prefix(VNC_SCHEME)?;
+fn parse_scheme_target(target: &str) -> Option<(SessionProtocol, String, u16)> {
+    let (protocol, rest, default_port) = if let Some(rest) = target.strip_prefix(VNC_SCHEME) {
+        (SessionProtocol::Vnc, rest, VNC_DEFAULT_PORT)
+    } else if let Some(rest) = target.strip_prefix(RDP_SCHEME) {
+        (SessionProtocol::Rdp, rest, RDP_DEFAULT_PORT)
+    } else {
+        return None;
+    };
     if rest.is_empty() || rest.chars().any(char::is_control) {
         return None;
     }
     // `SocketAddr` first so an IPv6 literal's brackets are handled by the parser
     // rather than by splitting on the last colon.
     if let Ok(address) = rest.parse::<SocketAddr>() {
-        return (address.port() != 0).then(|| (address.ip().to_string(), address.port()));
+        return (address.port() != 0).then(|| (protocol, address.ip().to_string(), address.port()));
     }
     let (host, port) = match rest.rsplit_once(':') {
         Some((host, port)) => (host, port.parse::<u16>().ok()?),
-        None => (rest, VNC_DEFAULT_PORT),
+        None => (rest, default_port),
     };
     if host.is_empty() || port == 0 {
         return None;
     }
-    Some((host.to_owned(), port))
+    Some((protocol, host.to_owned(), port))
 }
 
 fn parse_route(target: &str) -> Option<SessionRoute> {
-    if let Some((host, port)) = parse_vnc_target(target) {
-        return Some(SessionRoute::Vnc { host, port });
+    if let Some((protocol, host, port)) = parse_scheme_target(target) {
+        return Some(SessionRoute::Scheme {
+            protocol,
+            host,
+            port,
+        });
     }
     if let Ok(address) = target.parse::<SocketAddr>() {
         return (address.port() != 0).then_some(SessionRoute::Direct(address));
@@ -410,6 +426,8 @@ fn collect_engine_events(
     let ready_for_peer_info = match session.protocol {
         SessionProtocol::RustDesk => snapshot.phase == "authenticated",
         SessionProtocol::Vnc => matches!(snapshot.phase.as_str(), "connected" | "streaming"),
+        // No RDP session can exist yet, so nothing is ever ready.
+        SessionProtocol::Rdp => false,
     };
     if ready_for_peer_info && !session.peer_info_emitted {
         session.pending_events.push_back(json!({
@@ -725,12 +743,12 @@ pub fn session_start(session_id: String) -> String {
         let options = ViewerOptions {
             address: match &session.route {
                 SessionRoute::Direct(address) => Some(*address),
-                SessionRoute::Rendezvous(_) | SessionRoute::Vnc { .. } => None,
+                SessionRoute::Rendezvous(_) | SessionRoute::Scheme { .. } => None,
             },
             username: match &session.route {
                 SessionRoute::Direct(address) => address.ip().to_string(),
                 SessionRoute::Rendezvous(id) => id.clone(),
-                SessionRoute::Vnc { host, port } => format!("{host}:{port}"),
+                SessionRoute::Scheme { host, port, .. } => format!("{host}:{port}"),
             },
             local_id,
             local_name: "RustDesk HMOS".to_owned(),
@@ -768,14 +786,32 @@ pub fn session_start(session_id: String) -> String {
         // A VNC server authenticates during the handshake, so the connection
         // (and therefore the password) is used here and now. There is no later
         // step at which a password could be supplied.
-        SessionRoute::Vnc { host, port } => {
-            let password = std::mem::take(&mut password_for_vnc);
-            let password = (!password.is_empty()).then_some(password.as_str());
-            match VncLiveSession::open(&host, port, password, !view_only) {
-                Ok(session) => Ok(Arc::new(SessionBackend::Vnc(Arc::new(session)))),
-                Err(error) => Err(ViewerError::Vnc(error)),
+        SessionRoute::Scheme {
+            protocol,
+            host,
+            port,
+        } => match protocol {
+            SessionProtocol::Vnc => {
+                let password = std::mem::take(&mut password_for_vnc);
+                let password = (!password.is_empty()).then_some(password.as_str());
+                match VncLiveSession::open(&host, port, password, !view_only) {
+                    Ok(session) => Ok(Arc::new(SessionBackend::Vnc(Arc::new(session)))),
+                    Err(error) => Err(ViewerError::Vnc(error)),
+                }
             }
-        }
+            // RDP's connection sequence continues past negotiation with MCS,
+            // licensing, capabilities and channel joins, none of which this
+            // client implements. Refusing here is the honest answer: pretending
+            // to start a session would fail later and less clearly.
+            SessionProtocol::Rdp => Err(ViewerError::Rdp(
+                librustdesk::rdp::RdpError::NotImplemented(
+                    "session establishment (only the connection and negotiation phase exists)",
+                ),
+            )),
+            SessionProtocol::RustDesk => {
+                unreachable!("a scheme route never carries the RustDesk protocol")
+            }
+        },
         SessionRoute::Direct(_) => {
             Viewer::start(options, surface).map(|viewer| Arc::new(SessionBackend::RustDesk(viewer)))
         }
@@ -803,6 +839,8 @@ pub fn session_start(session_id: String) -> String {
             } else {
                 SessionProtocol::RustDesk
             };
+            // A failed RDP attempt never reaches here, so the recorded protocol
+            // is always one that actually started.
             session.viewer = Some(backend);
             action(
                 "session_start",
