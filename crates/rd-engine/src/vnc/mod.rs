@@ -7,13 +7,17 @@
 //!
 //! Split so each part can be read on its own:
 //! - [`protocol`] is the wire: constants, message encoders, rectangle decoding.
+//! - [`live`] is the running session: socket, reader thread, framebuffer.
 //! - [`auth`] is the DES that VNC authentication needs, with the password bit
 //!   reversal that trips up most first implementations.
 //! - this module is the session: handshake, initialisation, and the event loop
 //!   that turns server messages into framebuffer and clipboard state.
 
 pub mod auth;
+pub mod live;
 pub mod protocol;
+#[cfg(test)]
+pub mod scripted;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -27,12 +31,19 @@ use crate::vnc::protocol::{
 };
 
 /// Everything that can go wrong while talking to a VNC server.
-#[derive(Debug)]
+///
+/// Cloneable because `ViewerError` is, and a VNC failure travels through it.
+/// `std::io::Error` is not `Clone`, so an I/O failure keeps its message and
+/// [`std::io::ErrorKind`] instead of the error object; nothing downstream reads
+/// the original, and one cloneable error type across both protocols is worth
+/// more than the object.
+#[derive(Debug, Clone)]
 pub enum VncError {
     /// The socket failed.
     Io {
         what: &'static str,
-        source: std::io::Error,
+        kind: std::io::ErrorKind,
+        message: String,
     },
     /// The server sent something this client cannot use. The text names what.
     Protocol(String),
@@ -50,7 +61,11 @@ impl VncError {
     }
 
     pub fn io(what: &'static str, source: std::io::Error) -> Self {
-        Self::Io { what, source }
+        Self::Io {
+            what,
+            kind: source.kind(),
+            message: source.to_string(),
+        }
     }
 
     pub fn geometry(message: String) -> Self {
@@ -68,7 +83,13 @@ impl VncError {
 impl std::fmt::Display for VncError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io { what, source } => write!(formatter, "vnc {what}: {source}"),
+            Self::Io {
+                what,
+                kind,
+                message,
+            } => {
+                write!(formatter, "vnc {what} ({kind:?}): {message}")
+            }
             Self::Protocol(text) => write!(formatter, "vnc protocol: {text}"),
             Self::UnsupportedSecurity(offered) => write!(
                 formatter,
@@ -536,6 +557,14 @@ impl VncSession {
             .map_err(|error| VncError::io("key event", error))
     }
 
+    /// Shut the connection down so a blocked read returns.
+    ///
+    /// The reader thread spends its life inside `read`, so a close has to break
+    /// that call rather than wait for the server to send something.
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
     /// Send clipboard text to the server.
     pub fn send_clipboard(&mut self, text: &str) -> Result<(), VncError> {
         let message = encode_client_cut_text(text)?;
@@ -556,6 +585,148 @@ pub enum ServerMessage {
     },
     Bell,
     Clipboard(protocol::ServerCutText),
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::live::{RGBA_BYTES_PER_PIXEL, VncLiveSession};
+    use super::scripted::{ScriptedFrame, ScriptedServer};
+    use std::time::{Duration, Instant};
+
+    /// A 4x2 picture with four distinguishable colours, so a blit that writes
+    /// the wrong channel or the wrong row cannot pass.
+    fn sample_frame() -> ScriptedFrame {
+        let pixels = vec![
+            0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF, // row 0
+            0x000000, 0x123456, 0xABCDEF, 0x808080, // row 1
+        ];
+        ScriptedFrame {
+            width: 4,
+            height: 2,
+            pixels,
+        }
+    }
+
+    fn wait_for_frame(session: &VncLiveSession) -> Option<(u32, u32, Vec<u8>)> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(frame) = session.take_frame() {
+                return Some(frame);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_frame_from_a_server_reaches_the_frontend_as_opaque_rgba() {
+        let server = ScriptedServer::start(sample_frame());
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+
+        assert_eq!(session.server_name(), "scripted");
+        assert_eq!(session.server_version(), "003.008");
+        assert_eq!((session.width(), session.height()), (4, 2));
+
+        let (width, height, pixels) = wait_for_frame(&session).expect("a frame within 5s");
+        assert_eq!((width, height), (4, 2));
+        assert_eq!(pixels.len(), 4 * 2 * RGBA_BYTES_PER_PIXEL);
+
+        let expected = [
+            [0xFF, 0x00, 0x00, 0xFF],
+            [0x00, 0xFF, 0x00, 0xFF],
+            [0x00, 0x00, 0xFF, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x00, 0x00, 0x00, 0xFF],
+            [0x12, 0x34, 0x56, 0xFF],
+            [0xAB, 0xCD, 0xEF, 0xFF],
+            [0x80, 0x80, 0x80, 0xFF],
+        ];
+        for (index, want) in expected.iter().enumerate() {
+            let offset = index * RGBA_BYTES_PER_PIXEL;
+            assert_eq!(
+                &pixels[offset..offset + RGBA_BYTES_PER_PIXEL],
+                want,
+                "pixel {index} differs"
+            );
+        }
+
+        let snapshot = session.snapshot();
+        assert_eq!(snapshot.phase, "streaming");
+        assert_eq!(snapshot.error, None);
+        assert_eq!(snapshot.received_units, 1);
+        assert_eq!(snapshot.taken_frames, 1);
+        assert!(!snapshot.closed);
+
+        session.close();
+        server.join();
+    }
+
+    #[test]
+    fn a_taken_frame_is_not_handed_out_twice() {
+        let server = ScriptedServer::start(sample_frame());
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+        assert!(wait_for_frame(&session).is_some());
+        // The server painted once, so there is nothing new to take. Redrawing an
+        // unchanged picture at the frontend's polling rate is wasted work.
+        assert!(session.take_frame().is_none());
+        session.close();
+        server.join();
+    }
+
+    #[test]
+    fn input_is_accepted_and_a_pointer_outside_the_framebuffer_is_refused() {
+        let server = ScriptedServer::start(sample_frame());
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+        assert!(wait_for_frame(&session).is_some());
+
+        session.send_mouse(0, 1, 1).expect("pointer inside");
+        session.send_key(true, 0x61).expect("key press");
+        session.send_key(false, 0x61).expect("key release");
+        let outside = session.send_mouse(0, 99, 99);
+        assert!(
+            outside.is_err(),
+            "a pointer past the framebuffer must be refused"
+        );
+
+        session.close();
+        server.join();
+    }
+
+    #[test]
+    fn closing_a_session_ends_the_reader_and_reports_it() {
+        let server = ScriptedServer::start(sample_frame());
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+        assert!(wait_for_frame(&session).is_some());
+        session.close();
+        // A close is not a failure: the snapshot reports closed with no error.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = session.snapshot();
+            if snapshot.closed {
+                assert_eq!(snapshot.error, None, "a requested close is not an error");
+                break;
+            }
+            assert!(Instant::now() < deadline, "session did not report closed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Closing twice is harmless.
+        session.close();
+        server.join();
+    }
+
+    #[test]
+    fn the_forced_capture_rate_is_accepted_but_out_of_range_values_are_not() {
+        let server = ScriptedServer::start(sample_frame());
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+        // VNC servers push on change and have no capture rate, so a valid rate is
+        // accepted without affecting the stream, and an impossible one is
+        // rejected rather than silently ignored.
+        assert!(session.set_requested_fps(60).is_ok());
+        assert!(session.set_requested_fps(0).is_err());
+        assert!(session.set_requested_fps(241).is_err());
+        session.close();
+        server.join();
+    }
 }
 
 #[cfg(test)]

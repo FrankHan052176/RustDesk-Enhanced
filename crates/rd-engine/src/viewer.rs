@@ -374,6 +374,8 @@ pub enum ViewerError {
     TaskFailed,
     ReclamationUnconfirmed,
     Decoder(DecoderError),
+    /// A VNC session failed or refused an operation; the text says which.
+    Vnc(crate::vnc::VncError),
 }
 impl fmt::Display for ViewerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -381,6 +383,7 @@ impl fmt::Display for ViewerError {
         // embed peer LoginError/MessageBox/CloseReason strings or I/O diagnostics.
         match self {
             Self::Decoder(error) => write!(f, "Surface decoder: {error:?}"),
+            Self::Vnc(error) => write!(f, "{error}"),
             other => write!(f, "{other:?}"),
         }
     }

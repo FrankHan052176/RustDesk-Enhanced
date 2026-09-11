@@ -59,6 +59,8 @@ pub mod publisher;
 pub mod publisher;
 pub mod rendezvous;
 pub mod session;
+/// One interface over the protocols a session can speak (RustDesk, VNC).
+pub mod session_backend;
 pub mod transport;
 pub mod viewer;
 /// VNC (RFB) support.

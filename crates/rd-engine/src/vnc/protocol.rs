@@ -576,13 +576,26 @@ mod tests {
     }
 
     #[test]
-    fn preferred_format_decodes_to_rgb_in_the_low_bytes() {
-        // 0x00RRGGBB little-endian: the red byte comes last on the wire.
+    fn the_preferred_format_is_little_endian_with_red_in_the_low_byte() {
+        // The requested format is little-endian 32bpp with red at shift 16, so
+        // 0xRRGGBB reaches the wire as GG RR 00 and a pixel of 0x123456 is
+        // [0x56, 0x34, 0x12, 0x00].
         let pixels = [0x56u8, 0x34, 0x12, 0x00];
         assert_eq!(
             PREFERRED_PIXEL_FORMAT.decode_pixel(&pixels).unwrap(),
-            0x12_34_56
+            0x12_34_56,
+            "little-endian layout must read the first byte as the least significant"
         );
+    }
+
+    #[test]
+    fn a_big_endian_format_reads_the_other_way_round() {
+        let format = PixelFormat {
+            big_endian: true,
+            ..PREFERRED_PIXEL_FORMAT
+        };
+        let pixels = [0x00u8, 0x12, 0x34, 0x56];
+        assert_eq!(format.decode_pixel(&pixels).unwrap(), 0x12_34_56);
     }
 
     #[test]
