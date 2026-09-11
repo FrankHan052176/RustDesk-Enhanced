@@ -17,7 +17,7 @@
 //!   hard error rather than a retry.
 
 use crate::input::{KeyAction, MouseAction, MouseButton, normalize_absolute, windows_virtual_key};
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use winapi::{
     shared::minwindef::{DWORD, UINT},
     um::winuser::{
@@ -86,44 +86,45 @@ fn send(records: &[INPUT]) -> Result<(), InjectError> {
 }
 
 fn mouse_record(flags: DWORD, dx: i32, dy: i32, data: DWORD) -> INPUT {
-    // Safety: `INPUT` is a C union; zeroing then writing the active arm is the
-    // documented way to initialize it. `write` is required rather than an
-    // assignment through `mi()`, which only hands out `&MOUSEINPUT`.
-    let mut record: INPUT = unsafe { std::mem::zeroed() };
-    record.type_ = INPUT_MOUSE;
+    // Safety: zeroing an `INPUT` makes the union arm valid for any
+    // interpretation, so the write below initializes the arm that `type_`
+    // selects. `winapi` only exposes shared references through `u.mi()`, so the
+    // fields are written through raw pointers to a zeroed slot instead.
+    let mut slot: MaybeUninit<INPUT> = MaybeUninit::zeroed();
+    let base = slot.as_mut_ptr();
     unsafe {
-        std::ptr::write(
-            record.u.mi(),
-            MOUSEINPUT {
+        std::ptr::addr_of_mut!((*base).u)
+            .cast::<MOUSEINPUT>()
+            .write(MOUSEINPUT {
                 dx,
                 dy,
                 mouseData: data,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
-            },
-        );
+            });
+        std::ptr::addr_of_mut!((*base).type_).write(INPUT_MOUSE);
+        slot.assume_init()
     }
-    record
 }
 
 fn key_record(vk: u16, scan: u16, flags: DWORD) -> INPUT {
     // Safety: as above; the keyboard arm is the active one here.
-    let mut record: INPUT = unsafe { std::mem::zeroed() };
-    record.type_ = INPUT_KEYBOARD;
+    let mut slot: MaybeUninit<INPUT> = MaybeUninit::zeroed();
+    let base = slot.as_mut_ptr();
     unsafe {
-        std::ptr::write(
-            record.u.ki(),
-            KEYBDINPUT {
+        std::ptr::addr_of_mut!((*base).u)
+            .cast::<KEYBDINPUT>()
+            .write(KEYBDINPUT {
                 wVk: vk,
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
-            },
-        );
+            });
+        std::ptr::addr_of_mut!((*base).type_).write(INPUT_KEYBOARD);
+        slot.assume_init()
     }
-    record
 }
 
 fn button_flags(button: MouseButton, down: bool) -> (DWORD, DWORD) {
