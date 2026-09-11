@@ -347,7 +347,7 @@ fn peer_info(options: &HostOptions, codecs: Encoders) -> PeerInfo {
     PeerInfo {
         hostname: "RustDesk".into(),
         platform: options.platform.clone(),
-        version: "1.4.9".into(),
+        version: crate::REPORTED_VERSION.into(),
         displays: vec![DisplayInfo {
             width: options.width,
             height: options.height,

@@ -1,11 +1,26 @@
 //! Replacement RustDesk runtime. Wire definitions and cryptography retain the
 //! upstream contract; legacy Connection/VideoService/VideoHandler are not linked.
+
+/// The protocol/peer version this runtime reports to remotes.
+///
+/// It is a wire-visible value: peers gate features on it, so it names the
+/// original release whose semantics this runtime implements rather than this
+/// crate's own `CARGO_PKG_VERSION`.
+pub const REPORTED_VERSION: &str = "1.4.9";
+
+/// Product name shown to peers and in locally generated text.
+pub const APP_NAME: &str = "RustDesk";
+
 pub mod authentication;
 mod executor;
 /// The Flutter frontend bridge surface. It compiles only with the `flutter`
 /// feature, so the OHOS HAR and the Windows host never link FRB.
 #[cfg(feature = "flutter")]
 pub mod flutter_ffi;
+/// Application state the bridge reads and writes. Private: it is an
+/// implementation detail of the bridge, not part of any FFI surface.
+#[cfg(feature = "flutter")]
+mod flutter_state;
 pub mod handshake;
 #[cfg(any(
     not(target_os = "windows"),

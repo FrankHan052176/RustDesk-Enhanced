@@ -535,12 +535,12 @@ pub fn main_get_http_status(url: String) -> Option<String> {
 
 #[allow(unused_variables)]
 pub fn main_get_option(key: String) -> String {
-    String::new()
+    crate::flutter_state::get_option(&key)
 }
 
 #[allow(unused_variables)]
 pub fn main_get_option_sync(key: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::get_option(&key))
 }
 
 #[allow(unused_variables)]
@@ -549,16 +549,18 @@ pub fn main_get_error() -> String {
 }
 
 #[allow(unused_variables)]
-pub fn main_set_option(key: String, value: String) {}
+pub fn main_set_option(key: String, value: String) {
+    crate::flutter_state::set_option(&key, &value)
+}
 
 #[allow(unused_variables)]
 pub fn main_get_options() -> String {
-    String::new()
+    crate::flutter_state::options_json()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_options_sync() -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::options_json())
 }
 
 #[allow(unused_variables)]
@@ -584,27 +586,27 @@ pub fn main_get_socks() -> Vec<String> {
 
 #[allow(unused_variables)]
 pub fn main_get_app_name() -> String {
-    String::new()
+    crate::flutter_state::app_name()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_app_name_sync() -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::app_name())
 }
 
 #[allow(unused_variables)]
 pub fn main_uri_prefix_sync() -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::uri_prefix())
 }
 
 #[allow(unused_variables)]
 pub fn main_get_license() -> String {
-    String::new()
+    crate::flutter_state::license()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_version() -> String {
-    String::new()
+    crate::flutter_state::version()
 }
 
 #[allow(unused_variables)]
@@ -635,7 +637,7 @@ pub fn main_check_connect_status() {}
 
 #[allow(unused_variables)]
 pub fn main_is_using_public_server() -> bool {
-    false
+    crate::flutter_state::is_using_public_server()
 }
 
 #[allow(unused_variables)]
@@ -643,7 +645,7 @@ pub fn main_discover() {}
 
 #[allow(unused_variables)]
 pub fn main_get_api_server() -> String {
-    String::new()
+    crate::flutter_state::api_server()
 }
 
 #[allow(unused_variables)]
@@ -661,7 +663,7 @@ pub fn main_http_request(url: String, method: String, body: Option<String>, head
 
 #[allow(unused_variables)]
 pub fn main_get_local_option(key: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::get_local_option(&key))
 }
 
 #[allow(unused_variables)]
@@ -680,7 +682,9 @@ pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
 }
 
 #[allow(unused_variables)]
-pub fn main_set_local_option(key: String, value: String) {}
+pub fn main_set_local_option(key: String, value: String) {
+    crate::flutter_state::set_local_option(&key, &value)
+}
 
 #[allow(unused_variables)]
 pub fn main_handle_wayland_screencast_restore_token(_key: String, _value: String) -> String {
@@ -713,12 +717,12 @@ pub fn main_clip_cursor(
 
 #[allow(unused_variables)]
 pub fn main_get_my_id() -> String {
-    String::new()
+    crate::flutter_state::my_id()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_uuid() -> String {
-    String::new()
+    crate::flutter_state::uuid()
 }
 
 #[allow(unused_variables)]
@@ -813,7 +817,7 @@ pub fn main_handle_relay_id(id: String) -> String {
 
 #[allow(unused_variables)]
 pub fn main_is_option_fixed(key: String) -> SyncReturn<bool> {
-    SyncReturn(false)
+    SyncReturn(crate::flutter_state::is_option_fixed(&key))
 }
 
 #[allow(unused_variables)]
@@ -876,12 +880,14 @@ pub fn main_get_software_update_url() {}
 
 #[allow(unused_variables)]
 pub fn main_get_home_dir() -> String {
-    String::new()
+    hbb_common::config::Config::get_home()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_langs() -> String {
-    String::new()
+    crate::flutter_state::langs_json()
 }
 
 #[allow(unused_variables)]
@@ -1157,12 +1163,12 @@ pub fn cm_get_config(name: String) -> String {
 
 #[allow(unused_variables)]
 pub fn main_get_build_date() -> String {
-    String::new()
+    crate::flutter_state::build_date()
 }
 
 #[allow(unused_variables)]
 pub fn translate(name: String, locale: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::translate(name, locale))
 }
 
 #[allow(unused_variables)]
@@ -1198,7 +1204,7 @@ pub fn query_onlines(ids: Vec<String>) {}
 
 #[allow(unused_variables)]
 pub fn version_to_number(v: String) -> SyncReturn<i64> {
-    SyncReturn(0)
+    SyncReturn(hbb_common::get_version_number(&v))
 }
 
 #[allow(unused_variables)]
@@ -1488,12 +1494,12 @@ pub fn main_get_printer_names() -> SyncReturn<String> {
 
 #[allow(unused_variables)]
 pub fn main_get_common(key: String) -> String {
-    String::new()
+    crate::flutter_state::common(&key).unwrap_or_default()
 }
 
 #[allow(unused_variables)]
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
-    SyncReturn(String::new())
+    SyncReturn(crate::flutter_state::common(&key).unwrap_or_default())
 }
 
 #[allow(unused_variables)]

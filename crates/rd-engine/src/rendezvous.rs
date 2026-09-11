@@ -504,7 +504,7 @@ async fn connect(
         licence_key: config.licence_key.clone(),
         nat_type: NatType::UNKNOWN_NAT.into(),
         conn_type: ConnType::DEFAULT_CONN.into(),
-        version: "1.4.9".into(),
+        version: crate::REPORTED_VERSION.into(),
         ..Default::default()
     });
     let mut response = None;
