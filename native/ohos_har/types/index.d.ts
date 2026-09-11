@@ -215,6 +215,8 @@ export declare function sessionSendMouse(sessionId: string, mouseJson: string): 
 
 export declare function sessionSendMouseEvent(sessionId: string, eventKind: number, button: number, x: number, y: number, relativeMarker: number): boolean
 
+export declare function sessionInputDeliveryStatus(sessionId: string): string
+
 export declare function sessionSendNote(sessionId: string, note: string): void
 
 export declare function sessionSendPointer(sessionId: string, pointerJson: string): string

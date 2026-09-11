@@ -407,6 +407,12 @@ export function sessionSendMouseEvent(sessionId: string, eventKind: number, butt
   return native.sessionSendMouseEvent(sessionId, eventKind, button, x, y, relativeMarker);
 }
 
+// Delivery gates for local input. The boolean mouse entry point cannot explain a
+// refusal, so this exposes the same gates the injector enforces.
+export function sessionInputDeliveryStatus(sessionId: string): string {
+  return native.sessionInputDeliveryStatus(sessionId);
+}
+
 export function sessionSendNote(sessionId: string, note: string): void {
   native.sessionSendNote(sessionId, note);
 }

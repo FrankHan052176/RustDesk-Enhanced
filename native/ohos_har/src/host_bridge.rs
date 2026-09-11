@@ -100,6 +100,12 @@ pub fn engine_host_start(width: f64, height: f64, fps: f64) -> Result<String> {
         publisher_backend: PublisherBackend::Auto,
         output_index: 0,
         codec_selection: CodecSelection::Auto,
+        // The OHOS controlled side has no input-injection backend yet, so the
+        // host stays receive-only and never advertises the keyboard permission.
+        // Enabling the option without a sink would be refused anyway; this keeps
+        // the intent explicit at the call site.
+        input_injection: false,
+        input_sink: None,
     })
     .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?;
     let id = format!("modern-host-{sequence:x}");

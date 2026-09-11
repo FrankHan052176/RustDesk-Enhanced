@@ -10,7 +10,7 @@ use hbb_common::{
 use napi_derive_ohos::napi;
 use rd_engine::{
     rendezvous::RendezvousConfig,
-    viewer::{SurfaceLease, Viewer, ViewerOptions, ViewerSnapshot},
+    viewer::{SurfaceLease, Viewer, ViewerImageQuality, ViewerKey, ViewerOptions, ViewerSnapshot},
 };
 use serde_json::{json, Value};
 use std::{
@@ -113,6 +113,8 @@ struct CompatSession {
     requested_fps: u32,
     codec_preference: String,
     image_quality: String,
+    custom_image_quality: i32,
+    clipboard_enabled: bool,
     show_remote_cursor: bool,
     disable_audio: bool,
     phase: String,
@@ -126,6 +128,22 @@ struct CompatSession {
     permission_emitted: bool,
     close_emitted: bool,
     last_codec: String,
+    /// Last peer-authoritative display geometry, used to edge-trigger the
+    /// `switch_display` event without echoing the requested index back.
+    active_display: i32,
+    active_width: i32,
+    active_height: i32,
+    /// Report the display event once the first authoritative geometry exists.
+    display_reported: bool,
+    /// Monotonic start marker used as the telemetry generation, so a UI sampler
+    /// can tell a restarted session apart without seeing an identity.
+    generation: u64,
+    /// Microseconds since the first telemetry read, only ever increasing.
+    telemetry_elapsed_us: u64,
+    telemetry_last_read: Option<std::time::Instant>,
+    /// Bumped whenever the requested rate changes, so a UI sampler treats a
+    /// rate change as a new observation window instead of a counter reset.
+    intent_revision: u64,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, CompatSession>>> = OnceLock::new();
@@ -155,18 +173,105 @@ fn action(
 }
 
 fn session_value(session: &CompatSession) -> Value {
-    let phase = session
-        .viewer
+    let snapshot = session.viewer.as_ref().map(|viewer| viewer.snapshot());
+    let phase = snapshot
         .as_ref()
-        .map(|viewer| viewer.snapshot().phase)
+        .map(|snapshot| snapshot.phase.clone())
         .unwrap_or_else(|| session.phase.clone());
+    let image_quality = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.image_quality.clone())
+        .unwrap_or_else(|| session.image_quality.clone());
+    let requested_fps = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.requested_fps)
+        .unwrap_or(session.requested_fps);
+    let clipboard_allowed = snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.clipboard_allowed);
     json!({
         "sessionId": session.id,
         "coreSessionId": format!("enhanced:{}", session.id),
         "phase": phase,
         "peerTarget": session.target,
-        "viewOnly": session.view_only
+        "viewOnly": session.view_only,
+        "imageQuality": image_quality,
+        "customImageQuality": session.custom_image_quality,
+        "fps": requested_fps,
+        "clipboardEnabled": session.clipboard_enabled,
+        "clipboardAllowed": clipboard_allowed
     })
+}
+
+/// Map the frontend preset name onto a stored quality label. Unknown values
+/// fall back to balanced so a stale preference cannot broaden the stream.
+fn normalize_quality_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "best" => "best",
+        "custom" => "custom",
+        _ => "balanced",
+    }
+    .to_owned()
+}
+
+/// Build the engine quality from stored local state. `custom` without a valid
+/// custom value stays balanced rather than silently changing the preset.
+fn engine_quality(session: &CompatSession) -> ViewerImageQuality {
+    match session.image_quality.as_str() {
+        "low" => ViewerImageQuality::Low,
+        "best" => ViewerImageQuality::Best,
+        "custom" if (10..=2000).contains(&session.custom_image_quality) => {
+            ViewerImageQuality::Custom(session.custom_image_quality)
+        }
+        _ => ViewerImageQuality::Balanced,
+    }
+}
+
+/// Accept booleans, `1`/`0`, and the `Y`/`N` spelling the frontend may send.
+/// Monotonic per-session telemetry generation. Derived from the process clock so
+/// two sessions created in the same millisecond stay distinguishable, and no
+/// peer or user identity ever reaches the UI sampler.
+fn generation_marker() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Advance and return the monotonic telemetry elapsed time. A sampler that sees
+/// a non-increasing window discards the sample, so the clock never moves back.
+fn advance_telemetry_clock(session: &mut CompatSession) -> u64 {
+    let now = std::time::Instant::now();
+    match session.telemetry_last_read {
+        Some(previous) => {
+            let delta = now.saturating_duration_since(previous);
+            session.telemetry_elapsed_us = session
+                .telemetry_elapsed_us
+                .saturating_add(delta.as_micros().min(u64::MAX as u128) as u64);
+        }
+        None => session.telemetry_elapsed_us = 0,
+    }
+    session.telemetry_last_read = Some(now);
+    session.telemetry_elapsed_us
+}
+
+/// Accept booleans, `1`/`0`, and the `Y`/`N` spelling the frontend may send.
+fn json_flag(value: &Value, key: &str) -> bool {
+    match value.get(key) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => matches!(text.as_str(), "1" | "true" | "TRUE" | "Y" | "y"),
+        Some(Value::Number(number)) => number.as_i64().unwrap_or_default() != 0,
+        _ => false,
+    }
+}
+
+/// Key-name and USB HID resolution stay in the engine so this layer cannot
+/// drift from the wire contract.
+fn parse_legacy_key(name: &str) -> Option<ViewerKey> {
+    rd_engine::viewer::legacy_key_name(name)
+}
+
+fn usb_hid_to_viewer_key(usb_hid: u32, character: &str) -> Option<ViewerKey> {
+    rd_engine::viewer::usb_hid_key(usb_hid, character)
 }
 
 fn parse_route(target: &str) -> Option<SessionRoute> {
@@ -207,7 +312,11 @@ fn rendezvous_config(id: String) -> Result<RendezvousConfig, String> {
     })
 }
 
-fn collect_engine_events(session: &mut CompatSession, snapshot: &ViewerSnapshot) {
+fn collect_engine_events(
+    session: &mut CompatSession,
+    snapshot: &ViewerSnapshot,
+    peer: Option<&hbb_common::message_proto::PeerInfo>,
+) {
     let phase_changed = session.last_engine_phase != snapshot.phase;
     if snapshot.phase == "awaiting_insecure_confirmation" && phase_changed {
         session.pending_events.push_back(json!({
@@ -248,28 +357,88 @@ fn collect_engine_events(session: &mut CompatSession, snapshot: &ViewerSnapshot)
             "direct": (snapshot.route == "direct_tcp").to_string(),
             "stream_type": snapshot.route
         }));
-        let displays = json!([{
-            "x": 0,
-            "y": 0,
-            "width": snapshot.width,
-            "height": snapshot.height,
-            "cursor_embedded": false
-        }]);
+        // The peer's own report is the only source for displays and platform.
+        // Missing entries stay empty instead of being invented locally.
+        let mut displays: Vec<Value> = peer
+            .map(|peer| {
+                peer.displays
+                    .iter()
+                    .map(|display| {
+                        json!({
+                            "x": display.x,
+                            "y": display.y,
+                            "width": display.width,
+                            "height": display.height,
+                            "cursor_embedded": display.cursor_embedded,
+                            "name": display.name,
+                            "online": display.online,
+                            "scale": display.scale,
+                            "original_width": display.original_resolution.as_ref().map(|resolution| resolution.width).unwrap_or(0),
+                            "original_height": display.original_resolution.as_ref().map(|resolution| resolution.height).unwrap_or(0)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if displays.is_empty() {
+            // Without a peer report only the accepted stream geometry is
+            // published, and never a fabricated display index.
+            displays.push(json!({
+                "x": 0,
+                "y": 0,
+                "width": snapshot.width,
+                "height": snapshot.height,
+                "cursor_embedded": false
+            }));
+        }
+        let current_display = peer.map(|peer| peer.current_display).unwrap_or(0);
         session.pending_events.push_back(json!({
             "name": "peer_info",
-            "username": "",
-            "hostname": session.target,
-            "platform": "",
-            "version": "",
-            "current_display": "0",
-            "displays": displays.to_string()
+            "username": peer.map(|peer| peer.username.clone()).unwrap_or_default(),
+            "hostname": peer
+                .map(|peer| peer.hostname.clone())
+                .filter(|hostname| !hostname.is_empty())
+                .unwrap_or_else(|| session.target.clone()),
+            "platform": peer.map(|peer| peer.platform.clone()).unwrap_or_default(),
+            "version": peer.map(|peer| peer.version.clone()).unwrap_or_default(),
+            "current_display": current_display.to_string(),
+            "displays": json!(displays).to_string()
         }));
+        session.active_display = current_display;
+        session.active_width = snapshot.width;
+        session.active_height = snapshot.height;
+        // Emit the authoritative geometry on the next poll so the viewport can
+        // fit the real source before the first frame is presented.
+        session.display_reported = false;
         session.peer_info_emitted = true;
+    }
+    if session.peer_info_emitted {
+        let size_changed = snapshot.width > 0
+            && snapshot.height > 0
+            && (snapshot.width != session.active_width || snapshot.height != session.active_height);
+        if size_changed || !session.display_reported {
+            session.active_width = snapshot.width;
+            session.active_height = snapshot.height;
+            session.display_reported = true;
+            session.pending_events.push_back(json!({
+                "name": "switch_display",
+                "display": session.active_display.to_string(),
+                "x": "0",
+                "y": "0",
+                "width": snapshot.width.to_string(),
+                "height": snapshot.height.to_string(),
+                "cursor_embedded": "0",
+                "resolutions": "[]",
+                "original_width": snapshot.width.to_string(),
+                "original_height": snapshot.height.to_string()
+            }));
+        }
     }
     if session.peer_info_emitted && !session.permission_emitted {
         session.pending_events.push_back(json!({
             "name": "permission",
-            "keyboard": snapshot.keyboard_allowed.to_string()
+            "keyboard": snapshot.keyboard_allowed.to_string(),
+            "clipboard": snapshot.clipboard_allowed.to_string()
         }));
         session.permission_emitted = true;
     }
@@ -359,9 +528,29 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
             .get("isViewOnly")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        requested_fps: 60,
+        requested_fps: options
+            .get("customFps")
+            .and_then(Value::as_u64)
+            .and_then(|fps| u32::try_from(fps).ok())
+            .filter(|fps| (1..=240).contains(fps))
+            .unwrap_or(60),
         codec_preference: "auto".to_owned(),
-        image_quality: "balanced".to_owned(),
+        image_quality: normalize_quality_name(
+            options
+                .get("imageQuality")
+                .and_then(Value::as_str)
+                .unwrap_or("balanced"),
+        ),
+        custom_image_quality: options
+            .get("customImageQuality")
+            .and_then(Value::as_i64)
+            .and_then(|quality| i32::try_from(quality).ok())
+            .filter(|quality| (10..=2000).contains(quality))
+            .unwrap_or(0),
+        clipboard_enabled: options
+            .get("clipboardEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         show_remote_cursor: false,
         disable_audio: true,
         phase: "created".to_owned(),
@@ -375,6 +564,14 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         permission_emitted: false,
         close_emitted: false,
         last_codec: String::new(),
+        active_display: 0,
+        active_width: 0,
+        active_height: 0,
+        display_reported: false,
+        generation: generation_marker(),
+        telemetry_elapsed_us: 0,
+        telemetry_last_read: None,
+        intent_revision: 1,
     };
     registry.insert(session_id.clone(), session);
     let session = registry.get(&session_id).expect("inserted session");
@@ -462,6 +659,7 @@ pub fn session_start(session_id: String) -> String {
                 Some(session),
             );
         }
+        let quality = engine_quality(session);
         let options = ViewerOptions {
             address: match &session.route {
                 SessionRoute::Direct(address) => Some(*address),
@@ -475,6 +673,8 @@ pub fn session_start(session_id: String) -> String {
             local_name: "RustDesk HMOS".to_owned(),
             password: std::mem::take(&mut *session.password),
             requested_fps: session.requested_fps,
+            clipboard_enabled: session.clipboard_enabled,
+            image_quality: quality,
         };
         session.phase = "starting".to_owned();
         (
@@ -586,7 +786,8 @@ pub fn session_poll_events(session_id: String, limit: u32) -> String {
     };
     if let Some(viewer) = &session.viewer {
         let snapshot = viewer.snapshot();
-        collect_engine_events(session, &snapshot);
+        let peer = viewer.peer_info();
+        collect_engine_events(session, &snapshot, peer.as_ref());
     }
     let events: Vec<Value> = (0..limit.min(256))
         .filter_map(|_| session.pending_events.pop_front())
@@ -703,6 +904,479 @@ pub fn session_send_mouse_event(
         .is_some_and(|viewer| viewer.send_mouse(event_kind, button, x, y).is_ok())
 }
 
+/// Delivery gates for local input. Exposed because the boolean mouse entry point
+/// cannot explain why a pointer event was refused, and "the cursor does not
+/// move" is otherwise indistinguishable from a broken mapping.
+#[napi]
+pub fn session_input_delivery_status(session_id: String) -> String {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return json!({"ok": false, "message": "Session not found"}).to_string();
+    };
+    let snapshot = session.viewer.as_ref().map(|viewer| viewer.snapshot());
+    json!({
+        "ok": true,
+        "viewOnly": session.view_only,
+        "hasViewer": session.viewer.is_some(),
+        "phase": snapshot.as_ref().map(|snapshot| snapshot.phase.clone()).unwrap_or_default(),
+        "keyboardAllowed": snapshot.as_ref().is_some_and(|snapshot| snapshot.keyboard_allowed),
+        "clipboardAllowed": snapshot.as_ref().is_some_and(|snapshot| snapshot.clipboard_allowed),
+        "closed": snapshot.as_ref().is_some_and(|snapshot| snapshot.closed),
+        "width": snapshot.as_ref().map(|snapshot| snapshot.width).unwrap_or_default(),
+        "height": snapshot.as_ref().map(|snapshot| snapshot.height).unwrap_or_default(),
+        "mouseRefusal": match (&session.view_only, &session.viewer) {
+            (true, _) => Some("view_only"),
+            (_, None) => Some("not_started"),
+            (_, Some(viewer)) => viewer.mouse_refusal()
+        }
+    })
+    .to_string()
+}
+
+/// Legacy key payload from the ArkTS input controller:
+/// `{name, down, press, alt, ctrl, shift, command}`.
+#[napi]
+pub fn session_input_key(session_id: String, key_json: String) -> String {
+    let payload: Value = match serde_json::from_str(&key_json) {
+        Ok(payload) => payload,
+        Err(_) => return action("session_input_key", false, "Invalid key payload", None),
+    };
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(key) = parse_legacy_key(name) else {
+        return action("session_input_key", false, "Unknown key name", None);
+    };
+    let down = json_flag(&payload, "down");
+    let press = json_flag(&payload, "press");
+    if !down && !press {
+        return action(
+            "session_input_key",
+            false,
+            "Key event must be a press or a key down",
+            None,
+        );
+    }
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return action("session_input_key", false, "Session not found", None);
+    };
+    if session.view_only {
+        return action(
+            "session_input_key",
+            false,
+            "Input is disabled for a view-only session",
+            Some(session),
+        );
+    }
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_input_key",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    let result = viewer.send_key(
+        key,
+        down,
+        press,
+        json_flag(&payload, "alt"),
+        json_flag(&payload, "ctrl"),
+        json_flag(&payload, "shift"),
+        json_flag(&payload, "command") || json_flag(&payload, "meta"),
+    );
+    match result {
+        Ok(()) => action(
+            "session_input_key",
+            true,
+            "Forwarded key input to RustDesk",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_input_key",
+            false,
+            "The peer does not currently accept keyboard input",
+            Some(session),
+        ),
+    }
+}
+
+/// Flutter-style key payload: a USB HID usage code plus lock modes. Translated
+/// to the original legacy `chr`/control-key wire form so no local key synthesis
+/// or platform-specific scancode mapping is required.
+#[napi]
+pub fn session_handle_flutter_key_event(session_id: String, key_json: String) -> String {
+    let payload: Value = match serde_json::from_str(&key_json) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return action(
+                "session_handle_flutter_key_event",
+                false,
+                "Invalid Flutter key payload",
+                None,
+            );
+        }
+    };
+    let Some(usb_hid) = payload
+        .get("usb_hid")
+        .or_else(|| payload.get("usbHid"))
+        .and_then(Value::as_i64)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return action(
+            "session_handle_flutter_key_event",
+            false,
+            "Missing usb_hid in Flutter key payload",
+            None,
+        );
+    };
+    let down = payload
+        .get("down_or_up")
+        .or_else(|| payload.get("downOrUp"))
+        .or_else(|| payload.get("down"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let character = payload
+        .get("character")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(key) = usb_hid_to_viewer_key(usb_hid, character) else {
+        return action(
+            "session_handle_flutter_key_event",
+            false,
+            "Unsupported USB HID usage code",
+            None,
+        );
+    };
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return action(
+            "session_handle_flutter_key_event",
+            false,
+            "Session not found",
+            None,
+        );
+    };
+    if session.view_only {
+        return action(
+            "session_handle_flutter_key_event",
+            false,
+            "Input is disabled for a view-only session",
+            Some(session),
+        );
+    }
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_handle_flutter_key_event",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.send_key(key, down, false, false, false, false, false) {
+        Ok(()) => action(
+            "session_handle_flutter_key_event",
+            true,
+            "Forwarded Flutter key input to RustDesk",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_handle_flutter_key_event",
+            false,
+            "The peer does not currently accept keyboard input",
+            Some(session),
+        ),
+    }
+}
+
+/// Whole-string input through the protocol's sequence key event. This is the
+/// correct path for IME/CJK text, which has no single USB HID usage code.
+#[napi]
+pub fn session_input_string(session_id: String, value: String) -> String {
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return action("session_input_string", false, "Session not found", None);
+    };
+    if session.view_only {
+        return action(
+            "session_input_string",
+            false,
+            "Input is disabled for a view-only session",
+            Some(session),
+        );
+    }
+    if value.is_empty() {
+        return action(
+            "session_input_string",
+            false,
+            "Text is empty",
+            Some(session),
+        );
+    }
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_input_string",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.send_text(value) {
+        Ok(()) => action(
+            "session_input_string",
+            true,
+            "Forwarded text input to RustDesk",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_input_string",
+            false,
+            "The peer does not currently accept keyboard input",
+            Some(session),
+        ),
+    }
+}
+
+/// Keyboard focus enter/leave is client-local in the original protocol: the
+/// peer applies keys from the wire stream and has no grab request. This reports
+/// the acknowledged local focus decision instead of pretending to negotiate.
+#[napi]
+pub fn session_enter_or_leave(session_id: String, enter: bool) -> String {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return action("session_enter_or_leave", false, "Session not found", None);
+    };
+    if session.view_only {
+        return action(
+            "session_enter_or_leave",
+            false,
+            "Keyboard capture is disabled for a view-only session",
+            Some(session),
+        );
+    }
+    action(
+        "session_enter_or_leave",
+        session.viewer.is_some(),
+        if enter {
+            "Keyboard input is focused locally; the peer is the key target"
+        } else {
+            "Keyboard input left the local focus"
+        },
+        Some(session),
+    )
+}
+
+#[napi]
+pub fn session_send_clipboard(session_id: String, content: String) -> String {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return action("session_send_clipboard", false, "Session not found", None);
+    };
+    if session.view_only {
+        return action(
+            "session_send_clipboard",
+            false,
+            "Clipboard is disabled for a view-only session",
+            Some(session),
+        );
+    }
+    if !session.clipboard_enabled {
+        return action(
+            "session_send_clipboard",
+            false,
+            "Clipboard synchronization is disabled for this session",
+            Some(session),
+        );
+    }
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_send_clipboard",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.send_clipboard_text(content) {
+        Ok(()) => action(
+            "session_send_clipboard",
+            true,
+            "Queued text clipboard for RustDesk",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_send_clipboard",
+            false,
+            "Clipboard synchronization is disabled by the current session permissions",
+            Some(session),
+        ),
+    }
+}
+
+/// Read the newest inbound text clipboard payload. Reports `ok:false` with a
+/// null text when nothing new arrived, so a repeated poll cannot re-apply the
+/// same remote text over the local clipboard.
+#[napi]
+pub fn session_take_clipboard(session_id: String) -> String {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return action("session_take_clipboard", false, "Session not found", None);
+    };
+    if !session.clipboard_enabled {
+        return json!({
+            "ok": false,
+            "action": "session_take_clipboard",
+            "message": "Clipboard synchronization is disabled for this session",
+            "text": Value::Null,
+            "html": Value::Null,
+            "image": Value::Null
+        })
+        .to_string();
+    }
+    let text = session
+        .viewer
+        .as_ref()
+        .and_then(|viewer| viewer.take_clipboard_text());
+    json!({
+        "ok": text.is_some(),
+        "action": "session_take_clipboard",
+        "message": if text.is_some() {
+            "Remote clipboard text available"
+        } else {
+            "No native clipboard payload is available"
+        },
+        "text": text,
+        "html": Value::Null,
+        "image": Value::Null
+    })
+    .to_string()
+}
+
+#[napi]
+pub fn session_switch_display(session_id: String, displays_json: String) -> String {
+    let parsed: Value = match serde_json::from_str(&displays_json) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return action(
+                "session_switch_display",
+                false,
+                "Invalid display request",
+                None,
+            );
+        }
+    };
+    let target = parsed
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            parsed
+                .get("displays")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_i64)
+        })
+        .and_then(|display| i32::try_from(display).ok());
+    let Some(display) = target.filter(|display| *display == 0) else {
+        return action(
+            "session_switch_display",
+            false,
+            "Only the peer's primary display can be captured in this milestone",
+            None,
+        );
+    };
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return action("session_switch_display", false, "Session not found", None);
+    };
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_switch_display",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.switch_display(display, 0, 0) {
+        Ok(()) => {
+            session.active_display = display;
+            action(
+                "session_switch_display",
+                true,
+                "Requested RustDesk display switch",
+                Some(session),
+            )
+        }
+        Err(_) => action(
+            "session_switch_display",
+            false,
+            "Display switch could not be sent to the peer",
+            Some(session),
+        ),
+    }
+}
+
+#[napi]
+pub fn session_change_resolution(
+    session_id: String,
+    display: u32,
+    width: u32,
+    height: u32,
+) -> String {
+    let registry = lock(sessions());
+    let Some(session) = registry.get(&session_id) else {
+        return action(
+            "session_change_resolution",
+            false,
+            "Session not found",
+            None,
+        );
+    };
+    if session.view_only {
+        return action(
+            "session_change_resolution",
+            false,
+            "Remote resolution changes are disabled for a view-only session",
+            Some(session),
+        );
+    }
+    let (Ok(display), Ok(width), Ok(height)) = (
+        i32::try_from(display),
+        i32::try_from(width),
+        i32::try_from(height),
+    ) else {
+        return action(
+            "session_change_resolution",
+            false,
+            "Resolution values are out of range",
+            Some(session),
+        );
+    };
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_change_resolution",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.change_resolution(display, width, height) {
+        Ok(()) => action(
+            "session_change_resolution",
+            true,
+            "Requested RustDesk resolution change",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_change_resolution",
+            false,
+            "Resolution change could not be sent to the peer",
+            Some(session),
+        ),
+    }
+}
+
 #[napi]
 pub fn session_close(session_id: String) -> String {
     let session = lock(sessions()).remove(&session_id);
@@ -749,17 +1423,80 @@ pub fn session_set_image_quality(session_id: String, quality: String) -> String 
             None,
         );
     };
-    session.image_quality = quality;
-    action(
-        "session_set_image_quality",
-        true,
-        "Stored quality preference for this session",
-        Some(session),
-    )
+    if quality.trim().eq_ignore_ascii_case("custom")
+        && !(10..=2000).contains(&session.custom_image_quality)
+    {
+        return action(
+            "session_set_image_quality",
+            false,
+            "A custom quality value between 10 and 2000 is required",
+            Some(session),
+        );
+    }
+    session.image_quality = normalize_quality_name(&quality);
+    let engine = engine_quality(session);
+    // A live viewer negotiates immediately; before start the stored preset is
+    // carried by the login request instead.
+    match &session.viewer {
+        Some(viewer) => match viewer.set_image_quality(engine) {
+            Ok(()) => action(
+                "session_set_image_quality",
+                true,
+                "Requested remote image quality change",
+                Some(session),
+            ),
+            Err(_) => action(
+                "session_set_image_quality",
+                false,
+                "Image quality could not be sent to the peer",
+                Some(session),
+            ),
+        },
+        None => action(
+            "session_set_image_quality",
+            true,
+            "Stored quality preference for this session",
+            Some(session),
+        ),
+    }
 }
 
 #[napi]
-pub fn session_set_custom_image_quality(_session_id: String, _quality: u32) {}
+pub fn session_set_custom_image_quality(session_id: String, quality: u32) -> String {
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return action(
+            "session_set_custom_image_quality",
+            false,
+            "Session not found",
+            None,
+        );
+    };
+    let Some(value) = i32::try_from(quality)
+        .ok()
+        .filter(|value| (10..=2000).contains(value))
+    else {
+        return action(
+            "session_set_custom_image_quality",
+            false,
+            "Custom quality must be between 10 and 2000",
+            Some(session),
+        );
+    };
+    session.custom_image_quality = value;
+    if session.image_quality == "custom" {
+        let engine = engine_quality(session);
+        if let Some(viewer) = &session.viewer {
+            let _ = viewer.set_image_quality(engine);
+        }
+    }
+    action(
+        "session_set_custom_image_quality",
+        true,
+        "Updated custom quality",
+        Some(session),
+    )
+}
 
 #[napi]
 pub fn session_set_custom_fps(session_id: String, fps: u32) -> String {
@@ -767,21 +1504,39 @@ pub fn session_set_custom_fps(session_id: String, fps: u32) -> String {
     let Some(session) = registry.get_mut(&session_id) else {
         return action("session_set_custom_fps", false, "Session not found", None);
     };
-    if session.viewer.is_some() || !(1..=240).contains(&fps) {
+    if !(1..=240).contains(&fps) {
         return action(
             "session_set_custom_fps",
             false,
-            "FPS must be set before session start and be within 1..240",
+            "FPS must be within 1..240",
             Some(session),
         );
     }
     session.requested_fps = fps;
-    action(
-        "session_set_custom_fps",
-        true,
-        "Updated requested FPS",
-        Some(session),
-    )
+    session.intent_revision = session.intent_revision.saturating_add(1);
+    // A live viewer pushes the new rate; before start it is the login value.
+    match &session.viewer {
+        Some(viewer) => match viewer.set_requested_fps(fps) {
+            Ok(()) => action(
+                "session_set_custom_fps",
+                true,
+                "Requested remote capture rate change",
+                Some(session),
+            ),
+            Err(_) => action(
+                "session_set_custom_fps",
+                false,
+                "FPS could not be sent to the peer",
+                Some(session),
+            ),
+        },
+        None => action(
+            "session_set_custom_fps",
+            true,
+            "Updated requested FPS",
+            Some(session),
+        ),
+    }
 }
 
 #[napi]
@@ -882,6 +1637,261 @@ pub fn session_get_software_present_state(_session_id: String, _display: u32) ->
     .to_string()
 }
 
+/// Real decoder/stream counters exposed to the existing 1 Hz UI sampler.
+/// `receivedUnits` and `submittedUnits` come from the wire and the native
+/// decoder; `decodeCapacityFps` is reported as `null` because the engine makes
+/// no decode-capacity claim. `elapsedMs` is a monotonic observation clock, so
+/// the sampler's own window math stays honest.
+#[napi]
+pub fn session_get_frame_rate_snapshot(session_id: String, _display: u32) -> String {
+    let mut registry = lock(sessions());
+    let Some(session) = registry.get_mut(&session_id) else {
+        return json!({
+            "available": false,
+            "generation": "0",
+            "intentRevision": "0",
+            "desiredFps": Value::Null,
+            "safetyFpsCap": Value::Null,
+            "elapsedMs": "0",
+            "receivedPackets": "0",
+            "decodedFrames": "0",
+            "submittedFrames": "0",
+            "unavailableFrames": "0",
+            "noBufferFrames": "0",
+            "busyFrames": "0",
+            "decodeCalls": "0",
+            "decodeNs": "0",
+            "conversionCalls": "0",
+            "conversionNs": "0",
+            "targetCalls": "0",
+            "targetNs": "0",
+            "queueLen": "0",
+            "decodeCapacityFps": Value::Null,
+            "status": "disabled",
+            "recommendation": Value::Null,
+            "qualityRecommendationApplied": false
+        })
+        .to_string();
+    };
+    let elapsed_ms = advance_telemetry_clock(session) / 1000;
+    let generation = session.generation.to_string();
+    let intent_revision = session.intent_revision.to_string();
+    let desired_fps = session.requested_fps.to_string();
+    let snapshot = session.viewer.as_ref().map(|viewer| viewer.snapshot());
+    let (available, received, submitted, status) = match &snapshot {
+        Some(snapshot) if !snapshot.closed => (
+            true,
+            snapshot.received_units,
+            // Units pushed into the decoder and frames actually presented are
+            // distinct counters; report the presented count as submitted.
+            snapshot.pushed_units,
+            "observing",
+        ),
+        _ => (false, 0, 0, "disabled"),
+    };
+    json!({
+        "available": available,
+        "generation": generation,
+        "intentRevision": intent_revision,
+        "desiredFps": if available { Value::String(desired_fps) } else { Value::Null },
+        "safetyFpsCap": Value::Null,
+        "elapsedMs": elapsed_ms.to_string(),
+        "receivedPackets": received.to_string(),
+        "decodedFrames": submitted.to_string(),
+        "submittedFrames": submitted.to_string(),
+        "unavailableFrames": "0",
+        "noBufferFrames": "0",
+        "busyFrames": "0",
+        "decodeCalls": "0",
+        "decodeNs": "0",
+        "conversionCalls": "0",
+        "conversionNs": "0",
+        "targetCalls": "0",
+        "targetNs": "0",
+        "queueLen": "0",
+        "decodeCapacityFps": Value::Null,
+        "status": status,
+        "recommendation": Value::Null,
+        "qualityRecommendationApplied": false
+    })
+    .to_string()
+}
+
+/// Native decoder counters. The enhanced engine drives its own decoder and does
+/// not expose its internals as UI telemetry, so this reports unavailable rather
+/// than a fabricated decoder state.
+#[napi]
+pub fn session_get_native_decoder_snapshot(session_id: String, _display: u32) -> String {
+    let registry = lock(sessions());
+    let available = registry
+        .get(&session_id)
+        .and_then(|session| session.viewer.as_ref())
+        .map(|viewer| viewer.snapshot())
+        .is_some_and(|snapshot| !snapshot.closed && !snapshot.codec.is_empty());
+    json!({
+        "available": available,
+        "bound": available,
+        "state": if available { "native-surface" } else { "unbound" },
+        "reason": "hardware-surface-path",
+        "active": available,
+        "width": 0,
+        "height": 0,
+        "submittedFrames": 0,
+        "generation": "0"
+    })
+    .to_string()
+}
+
+/// The waiting-for-image dialog is a legacy core convenience: it appeared while
+/// the original client waited for its first decoded frame. The enhanced viewer
+/// reports `connection_ready` and its own phases, so this is an explicit no-op.
+#[napi]
+pub fn session_on_waiting_for_image_dialog_show(session_id: String) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    action(
+        "session_on_waiting_for_image_dialog_show",
+        session.is_some(),
+        "The enhanced viewer reports its own connection phases",
+        session,
+    )
+}
+
+/// Monotonic transfer job identifier reserved for the file-transfer bridge.
+#[napi]
+pub fn transfer_next_job_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[napi]
+pub fn session_cancel_job(session_id: String, _act_id: u32) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    action(
+        "session_cancel_job",
+        false,
+        "File transfer is not connected in this milestone",
+        session,
+    )
+}
+
+#[napi]
+pub fn session_send_chat(session_id: String, text: String) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    if text.trim().is_empty() {
+        return action("session_send_chat", false, "Chat message is empty", session);
+    }
+    action(
+        "session_send_chat",
+        false,
+        "Chat requires peer support that this session did not negotiate",
+        session,
+    )
+}
+
+#[napi]
+pub fn session_send_clipboard_image(session_id: String, image: Vec<u8>) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    let _ = image;
+    action(
+        "session_send_clipboard_image",
+        false,
+        "Image clipboard is not connected in this milestone",
+        session,
+    )
+}
+
+#[napi]
+pub fn session_send_clipboard_files(session_id: String, paths_json: String) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    let _ = paths_json;
+    action(
+        "session_send_clipboard_files",
+        false,
+        "File clipboard requires the file-transfer channel",
+        session,
+    )
+}
+
+#[napi]
+pub fn session_take_clipboard_image(session_id: String) -> Vec<u8> {
+    let registry = lock(sessions());
+    let _ = registry.get(&session_id);
+    Vec::new()
+}
+
+#[napi]
+pub fn session_get_rgba_size(_session_id: String, _display: u32) -> u32 {
+    0
+}
+
+#[napi]
+pub fn session_next_rgba(_session_id: String, _display: u32) {}
+
+#[napi]
+pub fn session_take_rgba_frame(_session_id: String, _display: u32) -> Vec<u8> {
+    Vec::new()
+}
+
+#[napi]
+pub fn session_read_remote_dir(session_id: String, _path: String, _include_hidden: bool) -> String {
+    let registry = lock(sessions());
+    action(
+        "session_read_remote_dir",
+        false,
+        "Remote file browsing requires the file-transfer channel",
+        registry.get(&session_id),
+    )
+}
+
+#[napi]
+pub fn session_send_files(
+    session_id: String,
+    _act_id: u32,
+    _path: String,
+    _to: String,
+    _file_num: u32,
+    _include_hidden: bool,
+    _is_remote: bool,
+    _is_dir: bool,
+) -> String {
+    let registry = lock(sessions());
+    action(
+        "session_send_files",
+        false,
+        "File transfer is not connected in this milestone",
+        registry.get(&session_id),
+    )
+}
+
+#[napi]
+pub fn session_set_confirm_override_file(session_id: String, _act_id: u32) -> String {
+    let registry = lock(sessions());
+    action(
+        "session_set_confirm_override_file",
+        false,
+        "File transfer is not connected in this milestone",
+        registry.get(&session_id),
+    )
+}
+
+#[napi]
+pub fn session_send_mouse(session_id: String, mouse_json: String) -> String {
+    let registry = lock(sessions());
+    let session = registry.get(&session_id);
+    let _ = mouse_json;
+    action(
+        "session_send_mouse",
+        false,
+        "Use sessionSendMouseEvent; the pointer stream is owned by the input controller",
+        session,
+    )
+}
+
 #[napi]
 pub fn session_set_video_paused(session_id: String, paused: bool) -> String {
     let registry = lock(sessions());
@@ -899,15 +1909,33 @@ pub fn session_set_video_paused(session_id: String, paused: bool) -> String {
 }
 
 #[napi]
-pub fn session_refresh(session_id: String, _display: u32) -> String {
+pub fn session_refresh(session_id: String, display: u32) -> String {
     let registry = lock(sessions());
-    let session = registry.get(&session_id);
-    action(
-        "session_refresh",
-        session.is_some(),
-        "The active stream supplies its initial refresh",
-        session,
-    )
+    let Some(session) = registry.get(&session_id) else {
+        return action("session_refresh", false, "Session not found", None);
+    };
+    let Some(viewer) = &session.viewer else {
+        return action(
+            "session_refresh",
+            false,
+            "Session is not started",
+            Some(session),
+        );
+    };
+    match viewer.refresh_video(i32::try_from(display).unwrap_or_default()) {
+        Ok(()) => action(
+            "session_refresh",
+            true,
+            "Requested a refresh of the remote display",
+            Some(session),
+        ),
+        Err(_) => action(
+            "session_refresh",
+            false,
+            "The refresh request could not be sent to the peer",
+            Some(session),
+        ),
+    }
 }
 
 #[napi]

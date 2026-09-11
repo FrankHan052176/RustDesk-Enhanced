@@ -21,6 +21,12 @@ hbb_common = { path = "../../libs/hbb_common" }
 tokio = { version = "=1.44.2", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 tokio-util = { version = "=0.7.15", features = ["codec", "rt"] }
 
+# Windows controlled-side input injection. `winapi` is already the crate
+# `hbb_common` uses on Windows; `winuser` provides SendInput and every
+# virtual-key constant the injector needs.
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
 [build-dependencies]
 cc = "1"
 

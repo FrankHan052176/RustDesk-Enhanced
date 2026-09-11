@@ -10,7 +10,7 @@ use rd_engine::{
         self, AdvertisedCodec, CapabilityError, CodecDirection, ScreenCaptureRateEvidence,
     },
     rendezvous::RendezvousConfig,
-    viewer::{SurfaceLease, Viewer, ViewerError, ViewerOptions},
+    viewer::{SurfaceLease, Viewer, ViewerError, ViewerImageQuality, ViewerOptions},
 };
 use serde_json::{json, Value};
 use std::{
@@ -353,6 +353,10 @@ pub fn engine_connect_id(
         local_name,
         password: std::mem::take(&mut *password),
         requested_fps,
+        // The modern ID path accepts remote copy/paste; the peer still has to
+        // grant the clipboard permission before anything is written.
+        clipboard_enabled: true,
+        image_quality: ViewerImageQuality::default(),
     };
     let config = RendezvousConfig {
         id: peer_id,
@@ -413,6 +417,8 @@ fn connect(
         local_name,
         password: std::mem::take(&mut *password),
         requested_fps,
+        clipboard_enabled: true,
+        image_quality: ViewerImageQuality::default(),
     };
     // start is nonblocking; no authentication or media work runs on the UI thread.
     register_viewer(surface_id, options, move |options, lease| match pin {

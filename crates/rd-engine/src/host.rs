@@ -1,12 +1,14 @@
 //! Single-peer, explicitly approved viewing host. No legacy app runtime.
 //! Authentication is not capture consent; the publisher retains the OS prompt.
-//! System input/file/audio/clipboard adapters are absent and never granted.
+//! Input injection exists only when the local operator arms it explicitly, and
+//! file/audio/clipboard adapters remain absent and are never granted.
 use crate::{
     authentication::{
         Approval, ApprovalProvider, AttemptPolicy, HostAuthConfig, NoSecondFactor, Passwords,
         Permissions, PrimaryPolicy,
     },
     handshake::{HostIdentity, Security},
+    input::{InputAction, decode_message},
     publisher::{Codec, CodecSelection, EncodedUnit, Publisher, PublisherBackend, PublisherConfig},
     session::{AuthenticatedParts, HostEvent, HostSession},
     transport::{WireReader, WireWriter},
@@ -47,7 +49,23 @@ pub struct HostOptions {
     pub publisher_backend: PublisherBackend,
     pub output_index: usize,
     pub codec_selection: CodecSelection,
+    /// Explicit local consent to inject input into this machine.
+    ///
+    /// Input injection is never implied by authentication, by an approval click,
+    /// or by the peer's own request. It must be armed here by the local operator,
+    /// and the injection sink below decides whether this build can honour it.
+    /// When it is `false` the peer is never granted the keyboard permission and
+    /// every inbound input message is dropped.
+    pub input_injection: bool,
+    /// Platform injection sink. `None` keeps the host receive-only even when
+    /// `input_injection` is set, which is how a platform without a backend stays
+    /// fail-closed instead of pretending to work.
+    pub input_sink: Option<InputSink>,
 }
+
+/// A platform injection sink. It returns `false` when the action was refused so
+/// the host can count refusals without guessing.
+pub type InputSink = fn(InputAction) -> bool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
@@ -87,6 +105,14 @@ pub struct HostSnapshot {
     pub encrypted: bool,
     pub sent_units: u64,
     pub sent_bytes: u64,
+    /// Actions accepted by the platform injection sink.
+    pub injected_inputs: u64,
+    /// Actions the sink refused after local policy allowed them.
+    pub refused_inputs: u64,
+    /// Chat messages dropped because this host has no chat feature. Chat is
+    /// removed rather than half-implemented, and the counter makes the removal
+    /// visible instead of silent.
+    pub dropped_chat_messages: u64,
     pub closed: bool,
 }
 
@@ -164,6 +190,9 @@ impl Host {
                 encrypted: false,
                 sent_units: 0,
                 sent_bytes: 0,
+                injected_inputs: 0,
+                refused_inputs: 0,
+                dropped_chat_messages: 0,
                 closed: false,
             }),
         });
@@ -237,6 +266,9 @@ impl Drop for Host {
 struct LocalApproval {
     state: Arc<State>,
     epoch: u64,
+    /// The grant a human approval may hand to the peer. Built from local policy
+    /// only: an approval click cannot widen what the operator already armed.
+    grant: Permissions,
 }
 impl ApprovalProvider for LocalApproval {
     fn check(&mut self, _: &LoginRequest) -> Approval {
@@ -245,7 +277,7 @@ impl ApprovalProvider for LocalApproval {
             return Approval::Pending;
         }
         match grant.decision {
-            1 => Approval::Approved(Permissions::default()),
+            1 => Approval::Approved(self.grant),
             2 => Approval::Denied,
             _ => Approval::Pending,
         }
@@ -264,6 +296,19 @@ struct Encoders {
     h264: bool,
     h265: bool,
 }
+/// Fail-closed local permission set for one session.
+///
+/// Injection requires both the operator's explicit opt-in and a compiled-in
+/// platform sink; either one missing leaves the peer without input. Nothing else
+/// is granted here, so the ceiling, the approval grant and the wire
+/// advertisement all agree by construction.
+fn local_permissions(options: &HostOptions) -> Permissions {
+    Permissions {
+        keyboard: options.input_injection && options.input_sink.is_some(),
+        ..Permissions::default()
+    }
+}
+
 fn publisher_config(options: &HostOptions, codec: Codec, fps: u32) -> PublisherConfig {
     PublisherConfig {
         codec,
@@ -334,6 +379,10 @@ async fn serve(state: Arc<State>, options: HostOptions) -> Result<(), HostError>
         publisher_backend: options.publisher_backend,
         output_index: options.output_index,
         codec_selection: options.codec_selection,
+        // Capability probing does not inject anything; keep the probe copy
+        // receive-only so it can never be a second injection path.
+        input_injection: false,
+        input_sink: None,
     };
     let codecs = tokio::task::spawn_blocking(move || encoders(&probe_options))
         .await
@@ -391,6 +440,11 @@ async fn authenticate(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+    // Local input policy, resolved once per session. Both the ceiling and the
+    // approval grant come from this one decision, so the peer can never hold an
+    // input permission this machine did not explicitly arm. Audio, file and
+    // clipboard stay denied unconditionally.
+    let local_permissions = local_permissions(options);
     let config = HostAuthConfig {
         accepted_targets: vec![
             options.id.clone(),
@@ -400,12 +454,13 @@ async fn authenticate(
         salt,
         passwords: Passwords::from_salted(Vec::new()),
         policy: PrimaryPolicy::ClickOnly,
-        ceiling: Permissions::default(),
+        ceiling: local_permissions,
         password_permissions: Permissions::default(),
         peer_info: peer_info(options, codecs),
         approval: Box::new(LocalApproval {
             state: state.clone(),
             epoch,
+            grant: local_permissions,
         }),
         second_factor: Box::new(NoSecondFactor),
         attempts: Box::new(NoPasswordAttempts),
@@ -511,12 +566,19 @@ async fn peer(
     });
     let cancel = state.cancel.child_token();
     let (tx, rx) = mpsc::channel(16);
+    // The reader re-checks the permission that authentication actually granted,
+    // so a viewer-side `disable-keyboard` downgrade also disables injection.
+    let parts_permissions = parts.context.permissions;
     let mut reader = tokio::spawn(read_peer(
+        state.clone(),
         parts.reader,
         tx,
         cancel.clone(),
         options.width,
         options.height,
+        // The reader re-checks the granted permission, never the local option.
+        parts_permissions,
+        options.input_sink,
     ));
     let config = publisher_config(options, codec, fps);
     let mut sender = tokio::spawn(publish(
@@ -554,11 +616,14 @@ async fn peer(
 }
 
 async fn read_peer(
+    state: Arc<State>,
     mut reader: WireReader,
     control: mpsc::Sender<Control>,
     cancel: CancellationToken,
     width: i32,
     height: i32,
+    permissions: Permissions,
+    input_sink: Option<InputSink>,
 ) -> Result<(), HostError> {
     loop {
         let message = tokio::select! {
@@ -609,9 +674,39 @@ async fn read_peer(
                 | Some(misc::Union::ChangeDisplayResolution(_)) => {
                     return Err(HostError::UnsupportedDisplay);
                 }
+                // Chat was removed from this controlled side. Counting the drop
+                // keeps the removal observable instead of silently swallowing a
+                // message the user believes was delivered.
+                Some(misc::Union::ChatMessage(_)) => {
+                    state.update(|s| s.dropped_chat_messages += 1);
+                    None
+                }
                 _ => None,
             },
-            // Input/file/audio/clipboard permissions are false. No fake input adapter.
+            // Pointer, keyboard and text input are injected only when the local
+            // operator armed a platform sink AND authentication granted the
+            // keyboard permission. Anything else is dropped, never forwarded to
+            // a legacy runtime and never answered with a fake success.
+            Some(union @ (message::Union::MouseEvent(_) | message::Union::KeyEvent(_))) => {
+                let Some(sink) = input_sink.filter(|_| permissions.keyboard) else {
+                    return Ok(());
+                };
+                match decode_message(&union) {
+                    // A malformed or unsupported action is dropped: guessing at a
+                    // key or button the user never pressed is worse than nothing.
+                    None => None,
+                    Some(action) => {
+                        if sink(action) {
+                            state.update(|s| s.injected_inputs += 1);
+                        } else {
+                            state.update(|s| s.refused_inputs += 1);
+                        }
+                        None
+                    }
+                }
+            }
+            // File/audio/clipboard adapters are absent. No fake adapter is
+            // installed and no permission is advertised for them.
             _ => None,
         };
         if let Some(output) = output {
@@ -711,7 +806,97 @@ async fn publish(
 
 #[cfg(test)]
 mod tests {
-    use super::LocalGrant;
+    use super::{HostOptions, InputSink, LocalGrant, local_permissions};
+    use crate::input::{InputAction, MouseAction};
+    use std::net::SocketAddr;
+
+    fn options(input_injection: bool, input_sink: Option<InputSink>) -> HostOptions {
+        HostOptions {
+            listen: "127.0.0.1:21118".parse::<SocketAddr>().expect("literal"),
+            id: "host".into(),
+            signing_key: hbb_common::sodiumoxide::crypto::sign::gen_keypair().1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate: 20_000_000,
+            platform: "Windows".into(),
+            publisher_backend: crate::publisher::PublisherBackend::Auto,
+            output_index: 0,
+            codec_selection: crate::publisher::CodecSelection::Auto,
+            input_injection,
+            input_sink,
+        }
+    }
+
+    fn counting_sink() -> InputSink {
+        fn sink(_action: InputAction) -> bool {
+            true
+        }
+        sink as InputSink
+    }
+
+    #[test]
+    fn input_requires_both_local_consent_and_a_platform_sink() {
+        // Neither an absent sink nor an unarmed option may grant input, and the
+        // audio, clipboard and file permissions stay denied in every case.
+        for (injection, sink) in [
+            (false, None),
+            (false, Some(counting_sink())),
+            (true, None),
+            (true, Some(counting_sink())),
+        ] {
+            let permissions = local_permissions(&options(injection, sink));
+            let expected = injection && sink.is_some();
+            assert_eq!(
+                permissions.keyboard,
+                expected,
+                "injection={injection} sink={}",
+                sink.is_some()
+            );
+            assert!(!permissions.audio);
+            assert!(!permissions.clipboard);
+            assert!(!permissions.file);
+        }
+    }
+
+    #[test]
+    fn an_approved_peer_still_gets_the_local_permission_set() {
+        // The approval grant is the local set, never a fresh default, so a
+        // human's approval click cannot widen what the operator armed.
+        let armed = options(true, Some(counting_sink()));
+        assert!(local_permissions(&armed).keyboard);
+        let unarmed = options(false, Some(counting_sink()));
+        assert!(!local_permissions(&unarmed).keyboard);
+    }
+
+    #[test]
+    fn a_denied_input_permission_never_reaches_the_sink() {
+        // Mirrors the reader gate: the sink is only consulted when the granted
+        // permission is present, which is what the reader checks before decoding.
+        let mut delivered = 0;
+        let sink: InputSink = {
+            fn sink(_action: InputAction) -> bool {
+                true
+            }
+            sink as InputSink
+        };
+        let granted = crate::authentication::Permissions {
+            keyboard: true,
+            ..Default::default()
+        };
+        for permissions in [crate::authentication::Permissions::default(), granted] {
+            if let Some(sink) = Some(sink).filter(|_| permissions.keyboard) {
+                if sink(InputAction::Mouse(MouseAction::MoveRelative {
+                    dx: 1,
+                    dy: 1,
+                })) {
+                    delivered += 1;
+                }
+            }
+        }
+        assert_eq!(delivered, 1, "only the granted session may inject");
+    }
+
     #[test]
     fn stale_or_repeated_ui_decision_never_authorizes_another_request() {
         let mut grant = LocalGrant {

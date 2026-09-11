@@ -9,6 +9,7 @@ pub mod handshake;
     dsh_windows_typecheck
 ))]
 pub mod host;
+pub mod input;
 pub mod media_capability;
 pub mod media_color;
 #[cfg(not(any(target_os = "windows", dsh_windows_typecheck)))]
@@ -24,6 +25,14 @@ pub mod rendezvous;
 pub mod session;
 pub mod transport;
 pub mod viewer;
+/// Windows controlled-side input injection. It exists only where `SendInput`
+/// does, and is never reachable from an unauthenticated peer.
+#[cfg(all(
+    any(target_os = "windows", dsh_windows_typecheck),
+    feature = "windows-modern-producer"
+))]
+#[path = "platform/windows_input.rs"]
+pub mod windows_input;
 #[cfg(all(
     any(target_os = "windows", dsh_windows_typecheck),
     feature = "windows-modern-producer"

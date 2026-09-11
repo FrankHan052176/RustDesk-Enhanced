@@ -5,8 +5,10 @@ mod windows {
         sodiumoxide::crypto::sign,
     };
     use rd_engine::{
-        host::{Host, HostOptions},
+        host::{Host, HostOptions, InputSink},
+        input::InputAction,
         publisher::{CodecSelection, PublisherBackend, probe_display},
+        windows_input,
         windows_native::enumerate_outputs,
     };
     use std::{
@@ -30,6 +32,7 @@ mod windows {
         test_auto_approve: bool,
         identity: Option<PathBuf>,
         list_outputs: bool,
+        allow_input: bool,
     }
     impl Default for Cli {
         fn default() -> Self {
@@ -44,6 +47,10 @@ mod windows {
                 test_auto_approve: false,
                 identity: None,
                 list_outputs: false,
+                // Input injection is off unless the operator asks for it. A
+                // controlled machine must never be remotely keyboard-controlled
+                // by default.
+                allow_input: false,
             }
         }
     }
@@ -93,11 +100,12 @@ mod windows {
                         .map_err(|_| "invalid --bitrate".to_string())?
                 }
                 "--identity" => cli.identity = Some(value(&mut args, &arg)?.into()),
+                "--allow-input" => cli.allow_input = true,
                 "--list-outputs" => cli.list_outputs = true,
                 "--test-auto-approve" => cli.test_auto_approve = true,
                 "--help" | "-h" => {
                     println!(
-                        "rd-engine-windows-host [--listen ADDR] [--id ID] [--identity PATH] [--backend auto|dxgi-nvenc] [--list-outputs] [--output INDEX] [--codec auto|h264|h265] [--fps N] [--bitrate BPS] [--test-auto-approve]"
+                        "rd-engine-windows-host [--listen ADDR] [--id ID] [--identity PATH] [--backend auto|dxgi-nvenc] [--list-outputs] [--output INDEX] [--codec auto|h264|h265] [--fps N] [--bitrate BPS] [--allow-input] [--test-auto-approve]"
                     );
                     println!("stdin commands: approve REQUEST_ID, deny REQUEST_ID, quit");
                     std::process::exit(0);
@@ -196,6 +204,15 @@ mod windows {
         Ok(())
     }
 
+    /// Bridge one decoded action to the Win32 injector. Returning `false` makes
+    /// the host count a refusal instead of assuming the OS applied it.
+    fn inject_input(action: InputAction) -> bool {
+        match action {
+            InputAction::Mouse(action) => windows_input::inject_mouse(true, action).is_ok(),
+            InputAction::Key(action) => windows_input::inject_key(true, action).is_ok(),
+        }
+    }
+
     pub async fn run() -> Result<(), String> {
         let cli = parse()?;
         if cli.list_outputs {
@@ -223,6 +240,11 @@ mod windows {
             publisher_backend: cli.backend,
             output_index: cli.output,
             codec_selection: cli.codec,
+            input_injection: cli.allow_input,
+            // The sink is the only place synthetic input is produced. Passing it
+            // is what makes `--allow-input` effective; without it the host stays
+            // receive-only and never advertises the keyboard permission.
+            input_sink: cli.allow_input.then_some(inject_input as InputSink),
         })
         .map_err(|error| format!("host start failed: {error}"))?;
 
@@ -235,6 +257,13 @@ mod windows {
             "display_name={:?}; no pixel-copy or software fallback path is enabled",
             display.name
         );
+        if cli.allow_input {
+            eprintln!(
+                "input_injection=armed sink=SendInput; the peer may control keyboard and pointer"
+            );
+        } else {
+            eprintln!("input_injection=off; the peer is view-only and holds no input permission");
+        }
         if cli.test_auto_approve {
             eprintln!("WARNING: test-only automatic approval is enabled explicitly");
         } else {
