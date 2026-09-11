@@ -45,6 +45,7 @@ const VIDEO_RECORDS: usize = 2;
 const VIDEO_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UNITS_PER_RECORD: usize = 256;
 const COMMANDS: usize = 128;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 // Local feature policy for this explicitly started interactive viewer: only
 // mouse input is implemented/enabled. It is NEVER granted by a peer report.
 const LOCAL_MOUSE_ENABLED: bool = true;
@@ -237,11 +238,18 @@ impl State {
 pub struct Viewer {
     state: Arc<State>,
     mouse: mpsc::Sender<Message>,
+    authentication: mpsc::Sender<AuthCommand>,
 }
 
 enum Connector {
     Direct(ViewerIdentity),
     Rendezvous(RendezvousConfig),
+}
+
+enum AuthCommand {
+    Password(Password),
+    SecondFactor(Password),
+    ContinueInsecure(bool),
 }
 
 fn runtime() -> Result<&'static Runtime, ViewerError> {
@@ -304,8 +312,7 @@ impl Viewer {
         lease: Arc<dyn SurfaceLease>,
         connector: Connector,
     ) -> Result<Arc<Self>, ViewerError> {
-        if lease.surface_id() == 0
-            || options.username.is_empty()
+        if options.username.is_empty()
             || options.local_id.is_empty()
             || options.username.len() > 512
             || options.local_id.len() > 512
@@ -317,6 +324,7 @@ impl Viewer {
         }
         let runtime = runtime()?;
         let (mouse, mouse_rx) = mpsc::channel(COMMANDS);
+        let (authentication, authentication_rx) = mpsc::channel(4);
         let state = Arc::new(State {
             inner: Mutex::new(Inner {
                 snapshot: ViewerSnapshot {
@@ -336,13 +344,22 @@ impl Viewer {
         let viewer = Arc::new(Self {
             state: state.clone(),
             mouse,
+            authentication,
         });
         // Tasks hold State, NOT Viewer: dropping the last UI/HAR Viewer triggers
         // cancellation instead of a self-retaining session/Surface reference.
         runtime.spawn(async move {
             // Keep one final lease until run/decoder teardown ends, including
             // authentication failures; release that reference off the IO thread.
-            let mut result = run(state.clone(), options, lease.clone(), mouse_rx, connector).await;
+            let mut result = run(
+                state.clone(),
+                options,
+                lease.clone(),
+                mouse_rx,
+                authentication_rx,
+                connector,
+            )
+            .await;
             if tokio::task::spawn_blocking(move || drop(lease))
                 .await
                 .is_err()
@@ -358,6 +375,39 @@ impl Viewer {
     }
     pub fn snapshot(&self) -> ViewerSnapshot {
         self.state.snapshot()
+    }
+
+    pub fn submit_password(&self, password: String) -> Result<(), ViewerError> {
+        if password.is_empty() || password.len() > 4096 {
+            return Err(ViewerError::InvalidOptions);
+        }
+        self.authentication
+            .try_send(AuthCommand::Password(Password(password.into_bytes())))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ViewerError::Backpressure,
+                mpsc::error::TrySendError::Closed(_) => ViewerError::Closed,
+            })
+    }
+
+    pub fn submit_second_factor(&self, code: String) -> Result<(), ViewerError> {
+        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ViewerError::InvalidOptions);
+        }
+        self.authentication
+            .try_send(AuthCommand::SecondFactor(Password(code.into_bytes())))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ViewerError::Backpressure,
+                mpsc::error::TrySendError::Closed(_) => ViewerError::Closed,
+            })
+    }
+
+    pub fn continue_insecure(&self, allow: bool) -> Result<(), ViewerError> {
+        self.authentication
+            .try_send(AuthCommand::ContinueInsecure(allow))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ViewerError::Backpressure,
+                mpsc::error::TrySendError::Closed(_) => ViewerError::Closed,
+            })
     }
 
     /// x/y are selected-display-local pixels for absolute events; the original
@@ -539,18 +589,33 @@ async fn authenticate(
     state: &State,
     mut options: ViewerOptions,
     decoders: Decoders,
+    mut authentication: mpsc::Receiver<AuthCommand>,
     connector: Connector,
 ) -> Result<AuthenticatedParts, ViewerError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Awaiting {
+        Network,
+        Password,
+        SecondFactor,
+    }
+    enum Incoming {
+        Network(ViewerEvent),
+        Command(AuthCommand),
+    }
+
     let password = Password(std::mem::take(&mut options.password).into_bytes());
-    let mut session = match connector {
+    let mut request = None;
+    let mut awaiting = Awaiting::Network;
+    let (mut session, insecure_confirmation_required) = match connector {
         Connector::Direct(identity) => {
             state.phase("connecting");
             let address = options.address.ok_or(ViewerError::InvalidOptions)?;
-            let session = ViewerSession::connect_direct(address, identity, Duration::from_secs(30))
+            let insecure_confirmation_required = matches!(identity, ViewerIdentity::LegacyUnverified);
+            let session = ViewerSession::connect_direct(address, identity, AUTH_TIMEOUT)
                 .await
                 .map_err(|_| ViewerError::ConnectFailed)?;
             state.route("direct_tcp");
-            session
+            (session, insecure_confirmation_required)
         }
         Connector::Rendezvous(config) => {
             state.phase("rendezvous");
@@ -565,21 +630,81 @@ async fn authenticate(
                 RouteKind::TcpHolePunch => "tcp_hole_punch",
                 RouteKind::Relay => "relay",
             });
-            ViewerSession::from_established(established, timeout, Duration::from_secs(30))
+            (
+                ViewerSession::from_established(established, timeout, AUTH_TIMEOUT),
+                false,
+            )
         }
     };
+    if insecure_confirmation_required {
+        state.phase("awaiting_insecure_confirmation");
+        loop {
+            match authentication.recv().await.ok_or(ViewerError::Closed)? {
+                AuthCommand::ContinueInsecure(true) => break,
+                AuthCommand::ContinueInsecure(false) => return Err(ViewerError::AuthenticationFailed),
+                // Password/2FA cannot bypass the explicit transport decision.
+                AuthCommand::Password(_) | AuthCommand::SecondFactor(_) => {}
+            }
+        }
+    }
     state.phase("authenticating");
     loop {
-        match session
-            .recv()
-            .await
-            .map_err(|_| ViewerError::AuthenticationFailed)?
-        {
+        let incoming = if awaiting == Awaiting::Network {
+            Incoming::Network(
+                session
+                    .recv()
+                    .await
+                    .map_err(|_| ViewerError::AuthenticationFailed)?,
+            )
+        } else {
+            tokio::select! {
+                event = session.recv() => Incoming::Network(
+                    event.map_err(|_| ViewerError::AuthenticationFailed)?
+                ),
+                command = authentication.recv() => Incoming::Command(
+                    command.ok_or(ViewerError::Closed)?
+                ),
+            }
+        };
+        let event = match incoming {
+            Incoming::Command(AuthCommand::Password(password))
+                if awaiting == Awaiting::Password =>
+            {
+                let request = request
+                    .as_ref()
+                    .cloned()
+                    .ok_or(ViewerError::AuthenticationFailed)?;
+                session
+                    .login(request, Some(&password.0))
+                    .await
+                    .map_err(|_| ViewerError::AuthenticationFailed)?;
+                state.phase("authenticating");
+                awaiting = Awaiting::Network;
+                continue;
+            }
+            Incoming::Command(AuthCommand::SecondFactor(mut code))
+                if awaiting == Awaiting::SecondFactor =>
+            {
+                let code = String::from_utf8(std::mem::take(&mut code.0))
+                    .map_err(|_| ViewerError::InvalidOptions)?;
+                session
+                    .send_second_factor(code)
+                    .await
+                    .map_err(|_| ViewerError::AuthenticationFailed)?;
+                state.phase("authenticating");
+                awaiting = Awaiting::Network;
+                continue;
+            }
+            Incoming::Command(AuthCommand::ContinueInsecure(_)) => continue,
+            Incoming::Command(_) => continue,
+            Incoming::Network(event) => event,
+        };
+        match event {
             ViewerEvent::Challenge => {
-                let request = login_request(&options, decoders);
+                let first = login_request(&options, decoders);
                 session
                     .login(
-                        request,
+                        first.clone(),
                         if password.0.is_empty() {
                             None
                         } else {
@@ -588,6 +713,7 @@ async fn authenticate(
                     )
                     .await
                     .map_err(|_| ViewerError::AuthenticationFailed)?;
+                request = Some(first);
             }
             ViewerEvent::Authorized(_) => {
                 return session
@@ -595,12 +721,22 @@ async fn authenticate(
                     .map_err(|_| ViewerError::AuthenticationFailed);
             }
             ViewerEvent::LoginError(error) if error == "No Password Access" => {
-                state.phase("awaiting_approval")
+                state.phase("awaiting_approval");
+                awaiting = Awaiting::Network;
+            }
+            ViewerEvent::LoginError(error) if error == "Wrong Password" => {
+                state.phase("awaiting_password");
+                awaiting = Awaiting::Password;
             }
             ViewerEvent::LoginError(error)
                 if error == "2FA Required" || error == "Wrong 2FA Code" =>
             {
-                return Err(ViewerError::SecondFactorUnsupported);
+                state.phase(if error == "Wrong 2FA Code" {
+                    "awaiting_2fa_retry"
+                } else {
+                    "awaiting_2fa"
+                });
+                awaiting = Awaiting::SecondFactor;
             }
             ViewerEvent::LoginError(_) => return Err(ViewerError::AuthenticationFailed),
             ViewerEvent::Closed => return Err(ViewerError::RemoteClosed),
@@ -624,6 +760,7 @@ async fn run(
     options: ViewerOptions,
     lease: Arc<dyn SurfaceLease>,
     mouse: mpsc::Receiver<Message>,
+    authentication: mpsc::Receiver<AuthCommand>,
     connector: Connector,
 ) -> Result<(), ViewerError> {
     // Metadata IPC is also off the UI / network worker. Do not discard a native
@@ -634,7 +771,7 @@ async fn run(
     let parts = tokio::select! {
         biased;
         _ = state.cancel.cancelled() => return Ok(()),
-        parts = authenticate(&state, options, caps, connector) => parts?,
+        parts = authenticate(&state, options, caps, authentication, connector) => parts?,
     };
     {
         let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());

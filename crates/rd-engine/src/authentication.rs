@@ -184,7 +184,9 @@ pub struct HostAuthentication {
 impl HostAuthentication {
     pub fn new(config: HostAuthConfig) -> Result<Self, &'static str> {
         hbb_common::sodiumoxide::init().map_err(|_| "Crypto initialization failed")?;
-        if config.accepted_targets.is_empty() || config.salt.is_empty() {
+        // Empty salt is a valid original-protocol configuration; passwords are
+        // still explicitly supplied as precomputed SHA256(password || salt).
+        if config.accepted_targets.is_empty() {
             return Err("Missing explicit authentication configuration");
         }
         const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";

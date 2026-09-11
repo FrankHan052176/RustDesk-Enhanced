@@ -50,10 +50,13 @@ impl AttemptPolicy for Budget {
     }
 }
 fn config(password: &[u8]) -> HostAuthConfig {
+    config_with_salt(password, "fixture-salt")
+}
+fn config_with_salt(password: &[u8], salt: &str) -> HostAuthConfig {
     HostAuthConfig {
         accepted_targets: vec!["test-target".into()],
-        salt: "fixture-salt".into(),
-        passwords: Passwords::from_salted(vec![salted_password(password, "fixture-salt")]),
+        salt: salt.into(),
+        passwords: Passwords::from_salted(vec![salted_password(password, salt)]),
         policy: PrimaryPolicy::PasswordOnly,
         ceiling: Permissions::default(),
         password_permissions: Permissions::default(),
@@ -113,7 +116,9 @@ async fn direct_plain_wrong_then_right_password_and_close_over_tcp() {
     let password = randombytes::randombytes(24);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let host_config = config(&password);
+    // Empty Hash.salt is legal in the original protocol and must still support
+    // a wrong-password retry followed by successful authentication.
+    let host_config = config_with_salt(&password, "");
     let host = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut host =

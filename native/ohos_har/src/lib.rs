@@ -2,6 +2,7 @@
 //! No legacy application initialization, protocol implementation or pixel path.
 mod compat;
 mod host_bridge;
+mod session_compat;
 use napi_derive_ohos::napi;
 use napi_ohos::{Error, Result, Status};
 use rd_engine::{

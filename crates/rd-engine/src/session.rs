@@ -486,7 +486,10 @@ impl ViewerSession {
                 return Ok(ViewerEvent::Progress);
             }
             Some(message::Union::Hash(hash)) if self.state == ViewerState::AwaitHash => {
-                if hash.salt.is_empty() || hash.challenge.is_empty() {
+                // Original peers may legally send an empty salt. The password
+                // derivation remains SHA256(password || salt); only the fresh
+                // challenge is required to be nonempty.
+                if hash.challenge.is_empty() {
                     self.state = ViewerState::Closed;
                     return Err(failure("Invalid authentication challenge"));
                 }
