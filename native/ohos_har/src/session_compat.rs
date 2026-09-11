@@ -8,7 +8,7 @@ use hbb_common::{
     sodiumoxide::crypto::sign,
 };
 use napi_derive_ohos::napi;
-use rd_engine::{
+use librustdesk::{
     rendezvous::RendezvousConfig,
     viewer::{SurfaceLease, Viewer, ViewerImageQuality, ViewerKey, ViewerOptions, ViewerSnapshot},
 };
@@ -267,11 +267,11 @@ fn json_flag(value: &Value, key: &str) -> bool {
 /// Key-name and USB HID resolution stay in the engine so this layer cannot
 /// drift from the wire contract.
 fn parse_legacy_key(name: &str) -> Option<ViewerKey> {
-    rd_engine::viewer::legacy_key_name(name)
+    librustdesk::viewer::legacy_key_name(name)
 }
 
 fn usb_hid_to_viewer_key(usb_hid: u32, character: &str) -> Option<ViewerKey> {
-    rd_engine::viewer::usb_hid_key(usb_hid, character)
+    librustdesk::viewer::usb_hid_key(usb_hid, character)
 }
 
 fn parse_route(target: &str) -> Option<SessionRoute> {

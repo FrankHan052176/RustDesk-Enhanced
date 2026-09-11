@@ -5,3 +5,14 @@ dist/
 native/ohos_har/dist/
 native/ohos_har/package.har
 native/ohos_har/package/libs/
+
+# Flutter Rust bridge codegen output. Regenerate with
+# scripts/flutter/generate-bridge.sh; the Dart side consumes the package that
+# the same script produces, and neither is a source of truth.
+crates/rd-engine/src/bridge_generated.rs
+crates/rd-engine/src/bridge_generated.io.rs
+crates/rd-engine/flutter_bridge/generated_bridge.dart
+crates/rd-engine/flutter_bridge/generated_bridge.freezed.dart
+crates/rd-engine/flutter_bridge/bridge_generated.h
+crates/rd-engine/flutter_bridge/.dart_tool/
+crates/rd-engine/.dart_tool/

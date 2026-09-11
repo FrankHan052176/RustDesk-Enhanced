@@ -1,5 +1,5 @@
 [package]
-name = "rd-engine"
+name = "rustdesk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -10,16 +10,27 @@ publish = false
 [workspace]
 resolver = "3"
 
+# The Flutter frontend loads this exact library name and constructs the bridge
+# class from the crate name, so both must match upstream RustDesk.
+[lib]
+name = "librustdesk"
+
 [features]
 # A double-click Windows candidate includes the modern producer contract without
 # requiring an environment variable or non-default Cargo feature.
 default = ["windows-modern-producer"]
 windows-modern-producer = []
+# The Flutter frontend bridge. Off by default so the OHOS HAR and the Windows
+# host never link the FRB runtime.
+flutter = ["dep:flutter_rust_bridge", "dep:uuid"]
 
 [dependencies]
 hbb_common = { path = "../../libs/hbb_common" }
 tokio = { version = "=1.44.2", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 tokio-util = { version = "=0.7.15", features = ["codec", "rt"] }
+# Only the Flutter FFI surface needs these; the OHOS HAR links neither.
+flutter_rust_bridge = { version = "=1.80", features = ["uuid"], optional = true }
+uuid = { version = "1.3", features = ["v4"], optional = true }
 
 # Windows controlled-side input injection. `winapi` is already the crate
 # `hbb_common` uses on Windows; `winuser` provides SendInput and every

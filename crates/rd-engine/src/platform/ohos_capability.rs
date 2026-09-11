@@ -211,9 +211,9 @@ mod native {
         let cap = unsafe {
             OH_AVCodec_GetCapabilityByCategory(
                 if hevc {
-                    c"video/hevc".as_ptr()
+                    b"video/hevc\0".as_ptr()
                 } else {
-                    c"video/avc".as_ptr()
+                    b"video/avc\0".as_ptr()
                 },
                 direction == CodecDirection::Encode,
                 HARDWARE,

@@ -4,7 +4,7 @@ use hbb_common::message_proto::{
     self as proto, LoginRequest, Message, Misc, OptionMessage, SupportedDecoding, message, misc,
     option_message::BoolOption, supported_decoding::PreferCodec, video_frame,
 };
-use rd_engine::{
+use librustdesk::{
     handshake::ViewerIdentity,
     session::{ViewerEvent, ViewerSession},
 };

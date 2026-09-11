@@ -9,7 +9,7 @@ use hbb_common::{
 };
 use napi_derive_ohos::napi;
 use napi_ohos::{Error, Result, Status};
-use rd_engine::{
+use librustdesk::{
     host::{Host, HostOptions},
     publisher::{CodecSelection, PublisherBackend},
 };

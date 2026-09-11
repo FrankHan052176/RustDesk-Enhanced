@@ -6,7 +6,7 @@ use hbb_common::{
     sodiumoxide::crypto::{box_, sign},
     tcp::FramedStream,
 };
-use rd_engine::{handshake::ViewerIdentity, session::ViewerSession};
+use librustdesk::{handshake::ViewerIdentity, session::ViewerSession};
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, net::TcpListener};
 

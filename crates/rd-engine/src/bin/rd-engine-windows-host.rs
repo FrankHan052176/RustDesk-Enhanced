@@ -4,7 +4,7 @@ mod windows {
         base64::{Engine as _, engine::general_purpose::STANDARD},
         sodiumoxide::crypto::sign,
     };
-    use rd_engine::{
+    use rustdesk::{
         host::{Host, HostOptions, InputSink},
         input::InputAction,
         publisher::{CodecSelection, PublisherBackend, probe_display},

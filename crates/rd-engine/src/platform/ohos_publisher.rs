@@ -945,8 +945,8 @@ mod native {
         static QUERY: Mutex<()> = Mutex::new(());
         let _guard = lock(&QUERY);
         let mime = match codec {
-            Codec::H264 => c"video/avc",
-            Codec::H265 => c"video/hevc",
+            Codec::H264 => &b"video/avc\0"[..],
+            Codec::H265 => &b"video/hevc\0"[..],
         };
         let capability = unsafe { OH_AVCodec_GetCapabilityByCategory(mime.as_ptr(), true, 0) };
         if capability.is_null() || !unsafe { OH_AVCapability_IsHardware(capability) } {
@@ -1020,8 +1020,8 @@ mod native {
         let a = owner.0.as_mut().unwrap();
         verify_geometry(config)?;
         let mime = match config.codec {
-            Codec::H264 => c"video/avc",
-            Codec::H265 => c"video/hevc",
+            Codec::H264 => &b"video/avc\0"[..],
+            Codec::H265 => &b"video/hevc\0"[..],
         };
         let name = hardware_name(config.codec)?;
         let encoder = unsafe { OH_VideoEncoder_CreateByName(name.as_ptr()) };

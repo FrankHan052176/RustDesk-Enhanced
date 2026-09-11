@@ -921,8 +921,8 @@ mod native {
     fn setup(owner: &mut Owner, config: DecoderConfig) -> Result<String, DecoderError> {
         let a = owner.0.as_mut().unwrap();
         let mime = match config.codec {
-            VideoCodec::H264 => c"video/avc",
-            VideoCodec::H265 => c"video/hevc",
+            VideoCodec::H264 => &b"video/avc\0"[..],
+            VideoCodec::H265 => &b"video/hevc\0"[..],
         };
         let cap = unsafe { OH_AVCodec_GetCapabilityByCategory(mime.as_ptr(), false, 0) };
         if cap.is_null() || !unsafe { OH_AVCapability_IsHardware(cap) } {

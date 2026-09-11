@@ -5,7 +5,7 @@ use hbb_common::{
     config::RS_PUB_KEY,
     sodiumoxide::crypto::sign,
 };
-use rd_engine::rendezvous::{RendezvousConfig, connect_viewer};
+use librustdesk::rendezvous::{RendezvousConfig, connect_viewer};
 use std::{error::Error, time::Duration};
 
 #[tokio::main(flavor = "current_thread")]

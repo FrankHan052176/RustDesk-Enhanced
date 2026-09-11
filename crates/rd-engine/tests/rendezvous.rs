@@ -14,7 +14,7 @@ use hbb_common::{
     tcp::{Encrypt, FramedStream},
     uuid::Uuid,
 };
-use rd_engine::{
+use librustdesk::{
     rendezvous::{RendezvousConfig, RouteKind, connect_viewer},
     session::{ViewerEvent, ViewerSession},
 };

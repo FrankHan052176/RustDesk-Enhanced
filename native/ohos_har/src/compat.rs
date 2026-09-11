@@ -5,7 +5,7 @@
 use hbb_common::config::Config;
 use napi_derive_ohos::napi;
 use napi_ohos::Result;
-use rd_engine::media_capability::{
+use librustdesk::media_capability::{
     query_h264_hardware_decoder, query_hevc_hardware_capabilities, AdvertisedCodec, CapabilityError,
 };
 use serde_json::{json, Value};
