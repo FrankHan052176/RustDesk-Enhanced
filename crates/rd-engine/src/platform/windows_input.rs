@@ -86,19 +86,23 @@ fn send(records: &[INPUT]) -> Result<(), InjectError> {
 }
 
 fn mouse_record(flags: DWORD, dx: i32, dy: i32, data: DWORD) -> INPUT {
-    // Safety: `INPUT` is a C union; zeroing then filling the active arm is the
-    // documented way to initialize it.
+    // Safety: `INPUT` is a C union; zeroing then writing the active arm is the
+    // documented way to initialize it. `write` is required rather than an
+    // assignment through `mi()`, which only hands out `&MOUSEINPUT`.
     let mut record: INPUT = unsafe { std::mem::zeroed() };
     record.type_ = INPUT_MOUSE;
     unsafe {
-        *record.u.mi() = MOUSEINPUT {
-            dx,
-            dy,
-            mouseData: data,
-            dwFlags: flags,
-            time: 0,
-            dwExtraInfo: 0,
-        };
+        std::ptr::write(
+            record.u.mi(),
+            MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        );
     }
     record
 }
@@ -108,13 +112,16 @@ fn key_record(vk: u16, scan: u16, flags: DWORD) -> INPUT {
     let mut record: INPUT = unsafe { std::mem::zeroed() };
     record.type_ = INPUT_KEYBOARD;
     unsafe {
-        *record.u.ki() = KEYBDINPUT {
-            wVk: vk,
-            wScan: scan,
-            dwFlags: flags,
-            time: 0,
-            dwExtraInfo: 0,
-        };
+        std::ptr::write(
+            record.u.ki(),
+            KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        );
     }
     record
 }
@@ -151,7 +158,10 @@ fn button_flags(button: MouseButton, down: bool) -> (DWORD, DWORD) {
             } else {
                 MOUSEEVENTF_XUP
             },
-            XBUTTON1,
+            // `winapi` declares `XBUTTON1`/`XBUTTON2` as `WORD` while
+            // `MOUSEINPUT::mouseData` is a `DWORD`; widen at the one place that
+            // crosses the two, rather than at every use.
+            DWORD::from(XBUTTON1),
         ),
         MouseButton::Forward => (
             if down {
@@ -159,7 +169,7 @@ fn button_flags(button: MouseButton, down: bool) -> (DWORD, DWORD) {
             } else {
                 MOUSEEVENTF_XUP
             },
-            XBUTTON2,
+            DWORD::from(XBUTTON2),
         ),
     }
 }

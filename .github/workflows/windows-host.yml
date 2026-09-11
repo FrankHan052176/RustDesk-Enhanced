@@ -56,6 +56,11 @@ jobs:
           workspaces: crates/rd-engine
       - name: Check formatting
         run: cargo fmt --check --manifest-path crates/rd-engine/Cargo.toml
+      # Type-check first. The crate has never had a working Windows build in this
+      # repository, so type errors are the normal failure mode; checking before
+      # testing reports them without waiting for the whole dependency graph.
+      - name: Type-check the engine on Windows
+        run: cargo check --locked --manifest-path crates/rd-engine/Cargo.toml
       - name: Test the whole engine on Windows
         run: cargo test --locked --manifest-path crates/rd-engine/Cargo.toml
       - name: Build the controlled host binary
