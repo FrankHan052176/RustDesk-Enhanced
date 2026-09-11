@@ -67,8 +67,14 @@ mod windows {
             .ok_or_else(|| format!("missing value for {name}"))
     }
     fn parse() -> Result<Cli, String> {
+        parse_args(std::env::args().skip(1).collect())
+    }
+
+    /// Parse an explicit argument vector. `parse` reads the process arguments,
+    /// which a test cannot set, so the token loop lives here.
+    fn parse_args(argv: Vec<String>) -> Result<Cli, String> {
         let mut cli = Cli::default();
-        let mut args = std::env::args().skip(1);
+        let mut args = argv.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--listen" => {
@@ -224,6 +230,29 @@ mod windows {
         }
     }
 
+    /// Turn the CLI's bitrate request into the value the encoder is opened with.
+    ///
+    /// Split out of `run` so the choice is observable: `run` cannot reach it on
+    /// a session that has no desktop (a service-session launch fails the display
+    /// probe first), yet the arithmetic still has to be checkable.
+    fn resolve_bitrate(cli: &Cli, width: i32, height: i32) -> Result<i64, String> {
+        if cli.bitrate > 0 {
+            return Ok(cli.bitrate);
+        }
+        let codec = match cli.codec {
+            CodecSelection::H265 => BitrateCodec::H265,
+            // `Auto` resolves to H.265 on this backend, and the encoder is
+            // chosen after this point, so the ceiling is the H.265 one.
+            CodecSelection::Auto | CodecSelection::H264 => BitrateCodec::H265,
+        };
+        let computed = auto_bitrate_bps(width, height, cli.fps, codec).unwrap_or(20_000_000);
+        eprintln!(
+            "bitrate=auto selected={computed} from {width}x{height}@{} codec={:?}",
+            cli.fps, cli.codec
+        );
+        Ok(computed)
+    }
+
     pub async fn run() -> Result<(), String> {
         let cli = parse()?;
         if cli.list_outputs {
@@ -239,23 +268,7 @@ mod windows {
         // The app no longer offers a picture-quality setting, so an unset
         // `--bitrate` has to become a real number here, once the display and
         // the capture rate are known.
-        let resolved_bitrate = if cli.bitrate > 0 {
-            cli.bitrate
-        } else {
-            let codec = match cli.codec {
-                CodecSelection::H265 => BitrateCodec::H265,
-                // `Auto` resolves to H.265 on this backend, and the encoder is
-                // chosen after this point, so the ceiling is the H.265 one.
-                CodecSelection::Auto | CodecSelection::H264 => BitrateCodec::H265,
-            };
-            let computed = auto_bitrate_bps(display.width, display.height, cli.fps, codec)
-                .unwrap_or(20_000_000);
-            eprintln!(
-                "bitrate=auto selected={computed} from {}x{}@{} codec={:?}",
-                display.width, display.height, cli.fps, cli.codec
-            );
-            computed
-        };
+        let resolved_bitrate = resolve_bitrate(&cli, display.width, display.height)?;
         let (public_key, signing_key) = load_or_create_identity(&identity_path)?;
         eprintln!("host_id={} identity_file={:?}", cli.id, identity_path);
         eprintln!("peer_signing_key_base64={}", STANDARD.encode(public_key.0));
@@ -394,6 +407,62 @@ mod windows {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
+        }
+    }
+    #[cfg(test)]
+    mod bitrate_tests {
+        use super::*;
+
+        /// `Cli` has no `Clone`, and the test only needs the two fields the
+        /// resolver reads, so it builds a default and overrides them.
+        fn cli_with(bitrate: i64, fps: u32, codec: CodecSelection) -> Cli {
+            let mut cli = Cli::default();
+            cli.bitrate = bitrate;
+            cli.fps = fps;
+            cli.codec = codec;
+            cli
+        }
+
+        #[test]
+        fn an_explicit_bitrate_is_never_second_guessed() {
+            let cli = cli_with(8_000_000, 120, CodecSelection::H265);
+            assert_eq!(resolve_bitrate(&cli, 2560, 1440).unwrap(), 8_000_000);
+        }
+
+        #[test]
+        fn the_auto_sentinel_produces_a_shape_derived_rate() {
+            let cli = cli_with(0, 120, CodecSelection::H265);
+            let resolved = resolve_bitrate(&cli, 2560, 1440).unwrap();
+            assert!(
+                (16_000_000..=50_000_000).contains(&resolved),
+                "1440p120 H.265 resolved to {resolved}"
+            );
+        }
+
+        #[test]
+        fn auto_still_yields_a_rate_when_the_shape_is_unusable() {
+            // A probe that reports nonsense must not open the encoder with zero.
+            let cli = cli_with(0, 60, CodecSelection::Auto);
+            assert_eq!(resolve_bitrate(&cli, 0, 0).unwrap(), 20_000_000);
+        }
+
+        #[test]
+        fn auto_bitrate_parses_beside_a_literal_value() {
+            assert_eq!(
+                parse_args(vec!["--bitrate".into(), "auto".into()])
+                    .unwrap()
+                    .bitrate,
+                0
+            );
+            assert_eq!(
+                parse_args(vec!["--bitrate".into(), "5000000".into()])
+                    .unwrap()
+                    .bitrate,
+                5_000_000
+            );
+            // The default is the sentinel, so an operator who passes nothing
+            // gets a derived rate rather than a hardcoded one.
+            assert_eq!(Cli::default().bitrate, 0);
         }
     }
 }
