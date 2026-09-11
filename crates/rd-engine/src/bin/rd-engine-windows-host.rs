@@ -4,7 +4,10 @@ mod windows {
         base64::{Engine as _, engine::general_purpose::STANDARD},
         sodiumoxide::crypto::sign,
     };
-    use rustdesk::{
+    // `[lib] name = "librustdesk"` fixes the crate's code-visible name, so the
+    // package name `rustdesk` is not importable. Every other target in this
+    // crate already imports `librustdesk`; this binary was the exception.
+    use librustdesk::{
         host::{Host, HostOptions, InputSink},
         input::InputAction,
         publisher::{CodecSelection, PublisherBackend, probe_display},
