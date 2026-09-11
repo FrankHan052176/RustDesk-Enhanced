@@ -8,6 +8,7 @@ mod windows {
     // package name `rustdesk` is not importable. Every other target in this
     // crate already imports `librustdesk`; this binary was the exception.
     use librustdesk::{
+        bitrate::{BitrateCodec, auto_bitrate_bps},
         host::{Host, HostOptions, InputSink},
         input::InputAction,
         publisher::{CodecSelection, PublisherBackend, probe_display},
@@ -46,7 +47,11 @@ mod windows {
                 output: 0,
                 codec: CodecSelection::Auto,
                 fps: 60,
-                bitrate: 20_000_000,
+                // `0` means "decide from the session shape at startup" rather
+                // than pinning an arbitrary default. An explicit value still
+                // wins, because an operator who knows the path better than the
+                // formula does should be able to say so.
+                bitrate: 0,
                 test_auto_approve: false,
                 identity: None,
                 list_outputs: false,
@@ -98,9 +103,12 @@ mod windows {
                         .map_err(|_| "invalid --fps".to_string())?
                 }
                 "--bitrate" => {
-                    cli.bitrate = value(&mut args, &arg)?
-                        .parse()
-                        .map_err(|_| "invalid --bitrate".to_string())?
+                    let raw = value(&mut args, &arg)?;
+                    cli.bitrate = if raw.eq_ignore_ascii_case("auto") {
+                        0
+                    } else {
+                        raw.parse().map_err(|_| "invalid --bitrate".to_string())?
+                    }
                 }
                 "--identity" => cli.identity = Some(value(&mut args, &arg)?.into()),
                 "--allow-input" => cli.allow_input = true,
@@ -108,7 +116,7 @@ mod windows {
                 "--test-auto-approve" => cli.test_auto_approve = true,
                 "--help" | "-h" => {
                     println!(
-                        "rd-engine-windows-host [--listen ADDR] [--id ID] [--identity PATH] [--backend auto|dxgi-nvenc] [--list-outputs] [--output INDEX] [--codec auto|h264|h265] [--fps N] [--bitrate BPS] [--allow-input] [--test-auto-approve]"
+                        "rd-engine-windows-host [--listen ADDR] [--id ID] [--identity PATH] [--backend auto|dxgi-nvenc] [--list-outputs] [--output INDEX] [--codec auto|h264|h265] [--fps N] [--bitrate BPS|auto] [--allow-input] [--test-auto-approve]"
                     );
                     println!("stdin commands: approve REQUEST_ID, deny REQUEST_ID, quit");
                     std::process::exit(0);
@@ -228,6 +236,26 @@ mod windows {
             Some(path) => path,
             None => default_identity_path()?,
         };
+        // The app no longer offers a picture-quality setting, so an unset
+        // `--bitrate` has to become a real number here, once the display and
+        // the capture rate are known.
+        let resolved_bitrate = if cli.bitrate > 0 {
+            cli.bitrate
+        } else {
+            let codec = match cli.codec {
+                CodecSelection::H265 => BitrateCodec::H265,
+                // `Auto` resolves to H.265 on this backend, and the encoder is
+                // chosen after this point, so the ceiling is the H.265 one.
+                CodecSelection::Auto | CodecSelection::H264 => BitrateCodec::H265,
+            };
+            let computed = auto_bitrate_bps(display.width, display.height, cli.fps, codec)
+                .unwrap_or(20_000_000);
+            eprintln!(
+                "bitrate=auto selected={computed} from {}x{}@{} codec={:?}",
+                display.width, display.height, cli.fps, cli.codec
+            );
+            computed
+        };
         let (public_key, signing_key) = load_or_create_identity(&identity_path)?;
         eprintln!("host_id={} identity_file={:?}", cli.id, identity_path);
         eprintln!("peer_signing_key_base64={}", STANDARD.encode(public_key.0));
@@ -238,7 +266,7 @@ mod windows {
             width: display.width,
             height: display.height,
             fps: cli.fps,
-            bitrate: cli.bitrate,
+            bitrate: resolved_bitrate,
             platform: "Windows".into(),
             publisher_backend: cli.backend,
             output_index: cli.output,

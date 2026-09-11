@@ -12,6 +12,8 @@ pub const REPORTED_VERSION: &str = "1.4.9";
 pub const APP_NAME: &str = "RustDesk";
 
 pub mod authentication;
+/// Encoder bitrate selection for a session shape. Used by the controlled host.
+pub mod bitrate;
 mod executor;
 /// The Flutter frontend bridge surface. It compiles only with the `flutter`
 /// feature, so the OHOS HAR and the Windows host never link FRB.
