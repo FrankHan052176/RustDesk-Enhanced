@@ -61,6 +61,8 @@ pub mod rendezvous;
 pub mod session;
 pub mod transport;
 pub mod viewer;
+/// VNC (RFB) support.
+pub mod vnc;
 /// Windows controlled-side input injection. It exists only where `SendInput`
 /// does, and is never reachable from an unauthenticated peer.
 #[cfg(all(
