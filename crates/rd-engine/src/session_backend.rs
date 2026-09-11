@@ -612,4 +612,175 @@ mod tests {
             0xFF52
         );
     }
+
+    /// A VNC backend over a scripted server, so the glue between the protocol
+    /// layer and the session vocabulary is exercised, not just each half.
+    fn vnc_backend_over(
+        frame: crate::vnc::scripted::ScriptedFrame,
+    ) -> (Arc<SessionBackend>, crate::vnc::scripted::ScriptedServer) {
+        let server = crate::vnc::scripted::ScriptedServer::start(frame);
+        let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
+        (Arc::new(SessionBackend::Vnc(Arc::new(session))), server)
+    }
+
+    fn wait_for_raw(backend: &SessionBackend) -> Option<(u32, u32, Vec<u8>)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(frame) = backend.take_raw_frame() {
+                return Some(frame);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn a_vnc_backend_reports_itself_in_the_shared_vocabulary() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF],
+        });
+        assert!(backend.is_vnc());
+        assert_eq!(backend.protocol(), "vnc");
+
+        let snapshot = backend.snapshot();
+        assert_eq!((snapshot.width, snapshot.height), (2, 2));
+        // The picture arrives as pixels, so the codec is not a guess at one.
+        assert_eq!(snapshot.codec, "raw");
+        assert_eq!(snapshot.route, "direct_tcp");
+        // RFB has no quality negotiation and no capture-rate control, so the
+        // snapshot must not imply either took effect.
+        assert_eq!(snapshot.image_quality, "n/a");
+        assert_eq!(snapshot.requested_fps, 0);
+        // A desktop VNC connection is not encrypted by the protocol and its
+        // identity is not verified, and the snapshot says so.
+        assert!(!snapshot.encrypted);
+        assert!(!snapshot.peer_verified);
+        assert!(!snapshot.closed);
+        backend.request_close();
+        server.join();
+    }
+
+    #[test]
+    fn a_vnc_backend_describes_its_single_framebuffer_as_a_display() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 4,
+            height: 3,
+            pixels: vec![0; 12],
+        });
+        let info = backend
+            .peer_info()
+            .expect("VNC must still describe its peer");
+        assert_eq!(info.hostname, "scripted");
+        assert_eq!(info.platform, "VNC");
+        assert_eq!(info.version, "003.008");
+        assert_eq!(info.displays.len(), 1);
+        assert_eq!(info.displays[0].width, 4);
+        assert_eq!(info.displays[0].height, 3);
+        assert_eq!(info.current_display, 0);
+        backend.request_close();
+        server.join();
+    }
+
+    #[test]
+    fn a_raw_frame_reaches_the_frontend_through_the_backend() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![0x112233, 0x445566],
+        });
+        let (_width, _height, pixels) = wait_for_raw(&backend).expect("a frame within 5s");
+        assert_eq!(&pixels[0..4], &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&pixels[4..8], &[0x44, 0x55, 0x66, 0xFF]);
+        backend.request_close();
+        server.join();
+    }
+
+    #[test]
+    fn the_operations_vnc_cannot_do_are_refused_with_a_reason() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![0; 4],
+        });
+        // Each of these has no RFB equivalent. Accepting them silently would let
+        // an operator believe a setting had been applied.
+        let quality = backend
+            .set_image_quality(ViewerImageQuality::Best)
+            .unwrap_err()
+            .to_string();
+        assert!(quality.contains("no image-quality control"), "{quality}");
+        let resolution = backend
+            .change_resolution(0, 1920, 1080)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            resolution.contains("cannot change the remote resolution"),
+            "{resolution}"
+        );
+        let password = backend
+            .submit_password("secret".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(password.contains("during the handshake"), "{password}");
+        let second = backend
+            .submit_second_factor("123456".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(second.contains("no second factor"), "{second}");
+        // Only display 0 exists.
+        assert!(backend.switch_display(1, 0, 0).is_err());
+        assert!(backend.switch_display(0, 0, 0).is_ok());
+        backend.request_close();
+        server.join();
+    }
+
+    #[test]
+    fn a_capture_rate_is_accepted_because_the_frontend_always_sends_one() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![0; 4],
+        });
+        // A valid rate is accepted so a frontend that always sends one keeps
+        // working, and the snapshot still reports that no rate is in effect.
+        assert!(backend.set_requested_fps(60).is_ok());
+        assert_eq!(backend.snapshot().requested_fps, 0);
+        assert!(backend.set_requested_fps(0).is_err());
+        backend.request_close();
+        server.join();
+    }
+
+    #[test]
+    fn a_ptr_drag_and_a_keystroke_reach_the_server() {
+        let (backend, server) = vnc_backend_over(crate::vnc::scripted::ScriptedFrame {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 16],
+        });
+        assert!(wait_for_raw(&backend).is_some());
+        // kind 1 = press, button 1 = left.
+        backend.send_mouse(1, 1, 1, 1).expect("left press");
+        backend.send_mouse(0, 0, 2, 2).expect("move");
+        // kind 2 = release.
+        backend.send_mouse(2, 1, 2, 2).expect("left release");
+        backend
+            .send_key(
+                ViewerKey::Character(b'a' as u32),
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .expect("keystroke");
+        // A character outside Latin-1 has no keysym, so it must be refused
+        // rather than dropped on the floor.
+        let translated = backend.send_text("中".to_owned()).unwrap_err().to_string();
+        assert!(translated.contains("Latin-1"), "{translated}");
+        backend.request_close();
+        server.join();
+    }
 }

@@ -16,7 +16,9 @@
 pub mod auth;
 pub mod live;
 pub mod protocol;
-#[cfg(test)]
+/// A minimal RFB server for tests, inside this crate and from a consumer that
+/// enables the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 pub mod scripted;
 
 use std::io::{Read, Write};

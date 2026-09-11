@@ -23,6 +23,9 @@ windows-modern-producer = []
 # The Flutter frontend bridge. Off by default so the OHOS HAR and the Windows
 # host never link the FRB runtime.
 flutter = ["dep:flutter_rust_bridge", "dep:uuid"]
+# Exposes the scripted RFB server used by tests. A consumer's integration test
+# needs it to drive a real session, and it must stay out of normal builds.
+test-support = []
 
 [dependencies]
 hbb_common = { path = "../../libs/hbb_common" }
