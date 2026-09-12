@@ -91,6 +91,19 @@ RD_NVENC_API rd_nvenc_status RD_NVENC_CALL rd_nvenc_encode_texture(rd_nvenc_enco
  */
 RD_NVENC_API rd_nvenc_status RD_NVENC_CALL
 rd_nvenc_release_output(rd_nvenc_encoder *encoder, const rd_nvenc_output_loan *loan);
+/*
+ * Change the encoder's bitrate while it is running.
+ *
+ * The rate control is CBR, so the average, the maximum and the VBV buffer all
+ * move together: raising only the average would leave the buffer sized for the
+ * old rate and the encoder would still stall on a busy frame. Takes effect on
+ * the next frame; no keyframe is forced and the stream stays valid.
+ *
+ * Refused while an output loan is outstanding, because reconfiguring mid-loan
+ * would change the rate for a frame that is still being read out.
+ */
+RD_NVENC_API rd_nvenc_status RD_NVENC_CALL
+rd_nvenc_set_bitrate(rd_nvenc_encoder *encoder, uint32_t bitrate_bps);
 /* Refuses an outstanding or partially released loan; finish release_output first. */
 RD_NVENC_API rd_nvenc_status RD_NVENC_CALL rd_nvenc_shutdown(rd_nvenc_encoder *encoder);
 RD_NVENC_API const char *RD_NVENC_CALL rd_nvenc_last_error(void);

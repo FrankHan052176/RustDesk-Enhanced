@@ -280,6 +280,9 @@ mod windows {
             height: display.height,
             fps: cli.fps,
             bitrate: resolved_bitrate,
+            // An explicit `--bitrate` is a ceiling the operator chose; the auto
+            // path keeps adapting from its computed starting point.
+            bitrate_auto: cli.bitrate <= 0,
             platform: "Windows".into(),
             publisher_backend: cli.backend,
             output_index: cli.output,

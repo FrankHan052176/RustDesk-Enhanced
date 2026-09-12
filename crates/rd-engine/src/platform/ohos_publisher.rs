@@ -91,6 +91,11 @@ pub struct PublisherConfig {
     pub height: i32,
     pub fps: u32,
     pub bitrate: i64,
+    /// Accepted for parity with the Windows publisher, where the rate follows the
+    /// picture. The OHOS encoder is configured per capture session and has no
+    /// reconfiguration path yet, so this is recorded and reported rather than
+    /// silently ignored.
+    pub auto_bitrate: bool,
     pub max_queued_units: usize,
     pub max_queued_bytes: usize,
     pub backend: PublisherBackend,

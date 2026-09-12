@@ -45,6 +45,9 @@ pub struct HostOptions {
     /// Screen source bound, not advertised codec-only throughput.
     pub fps: u32,
     pub bitrate: i64,
+    /// Whether `bitrate` is a starting point to adapt from rather than a fixed
+    /// ceiling.
+    pub bitrate_auto: bool,
     pub platform: String,
     pub publisher_backend: PublisherBackend,
     pub output_index: usize,
@@ -316,6 +319,10 @@ fn publisher_config(options: &HostOptions, codec: Codec, fps: u32) -> PublisherC
         height: options.height,
         fps,
         bitrate: options.bitrate,
+        // The CLI's `--bitrate auto` (and its default) is the sentinel: it seeds
+        // the starting ceiling, and the session then follows the picture instead
+        // of holding that value.
+        auto_bitrate: options.bitrate_auto,
         // Includes the AU currently being written. Two credits keep one ready
         // frame without accumulating a multi-frame capture-to-display tail.
         max_queued_units: 2,
@@ -375,6 +382,7 @@ async fn serve(state: Arc<State>, options: HostOptions) -> Result<(), HostError>
         height: options.height,
         fps: options.fps,
         bitrate: options.bitrate,
+        bitrate_auto: options.bitrate_auto,
         platform: options.platform.clone(),
         publisher_backend: options.publisher_backend,
         output_index: options.output_index,
@@ -819,6 +827,7 @@ mod tests {
             height: 1080,
             fps: 60,
             bitrate: 20_000_000,
+            bitrate_auto: false,
             platform: "Windows".into(),
             publisher_backend: crate::publisher::PublisherBackend::Auto,
             output_index: 0,

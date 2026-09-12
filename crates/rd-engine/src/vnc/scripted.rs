@@ -139,7 +139,7 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     // limitation. Client messages are all 6, 8 or 10 bytes here, apart from
     // ClientCutText, so the header is read and the body skipped by type.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
         let mut header = [0u8; 1];
         if stream.read_exact(&mut header).is_err() {

@@ -85,6 +85,11 @@ pub mod windows_native;
     feature = "windows-modern-producer"
 ))]
 pub use windows_native::NATIVE_BACKEND_IMPLEMENTED;
+/// Content-adaptive bitrate control for the controlled host. Platform-neutral
+/// arithmetic, kept beside the publisher it drives.
+#[cfg(feature = "windows-modern-producer")]
+#[path = "platform/windows_bitrate.rs"]
+pub mod windows_bitrate;
 #[cfg(feature = "windows-modern-producer")]
 #[path = "platform/windows_publisher.rs"]
 pub mod windows_publisher;

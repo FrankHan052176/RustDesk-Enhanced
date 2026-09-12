@@ -134,6 +134,13 @@ pub trait DirectNvenc<F: D3d11TextureLease>: Send {
         frame: F,
         force_keyframe: bool,
     ) -> Result<EncodedUnit, ProducerError>;
+    /// Change the encoder's bitrate while it is running.
+    ///
+    /// Separate from initialization because the rate has to follow the picture: a
+    /// still desktop and a full-screen video need very different budgets, and one
+    /// ceiling chosen at startup is wrong for whichever of them it was not chosen
+    /// for.
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), ProducerError>;
     fn close(&mut self) -> Result<(), ProducerError>;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +198,10 @@ impl<C: TextureCapture, E: DirectNvenc<C::Frame>> WindowsPublisher<C, E> {
     pub fn request_keyframe(&mut self) -> Result<(), ProducerError> {
         self.force_keyframe = true;
         Ok(())
+    }
+    /// Change the encoder's bitrate, for a caller that is following the picture.
+    pub fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), ProducerError> {
+        self.encoder.set_bitrate(bitrate_bps)
     }
     pub fn next_unit(&mut self) -> Result<Option<EncodedUnit>, ProducerError> {
         let Some(frame) = self.capture.next_texture()? else {
@@ -631,6 +642,9 @@ mod tests {
         }
         fn encode_texture(&mut self, _: Frame, _: bool) -> Result<EncodedUnit, ProducerError> {
             unreachable!()
+        }
+        fn set_bitrate(&mut self, _bitrate_bps: u32) -> Result<(), ProducerError> {
+            Ok(())
         }
         fn close(&mut self) -> Result<(), ProducerError> {
             self.close_attempts += 1;

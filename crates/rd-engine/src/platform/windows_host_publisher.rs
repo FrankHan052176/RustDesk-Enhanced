@@ -56,6 +56,9 @@ pub struct PublisherConfig {
     pub height: i32,
     pub fps: u32,
     pub bitrate: i64,
+    /// Follow the picture: adjust the bitrate from what the encoder spends,
+    /// instead of holding the startup value for the whole session.
+    pub auto_bitrate: bool,
     pub max_queued_units: usize,
     pub max_queued_bytes: usize,
     pub backend: PublisherBackend,
@@ -112,6 +115,7 @@ pub fn supported_codecs() -> Result<SupportedCodecs, PublisherError> {
         height: display.height,
         fps: 60,
         bitrate: 20_000_000,
+        auto_bitrate: false,
         max_queued_units: 1,
         max_queued_bytes: 32 * 1024 * 1024,
         backend: PublisherBackend::Auto,
@@ -520,6 +524,16 @@ fn worker_main(
             return;
         }
     };
+    // Follow the picture: a fixed budget chosen at startup cannot serve both a
+    // still desktop and full-screen video, and an under-encoded busy scene is
+    // what a flickering picture looks like.
+    let adapt_rate = config.auto_bitrate;
+    let mut bitrate = crate::windows_bitrate::BitrateController::new(
+        crate::windows_bitrate::StreamShape {
+            fps: config.fps_numerator.get(),
+        },
+        config.bitrate as i64,
+    );
     let run_error = loop {
         let force_keyframe = {
             let mut state = lock(&shared.state);
@@ -560,6 +574,17 @@ fn worker_main(
                 });
                 drop(state);
                 shared.changed.notify_one();
+                if adapt_rate
+                    && let crate::windows_bitrate::Decision::Change(target) =
+                        bitrate.observe(bytes as u64)
+                {
+                    // A failed reconfiguration is not fatal: the stream keeps
+                    // running at the previous rate, which is better than
+                    // dropping a session over a rate change.
+                    if publisher.set_bitrate(target as u32).is_ok() {
+                        eprintln!("bitrate=adaptive selected={target}");
+                    }
+                }
             }
             Ok(None) => {}
             Err(error) => break Some(map_producer(error)),

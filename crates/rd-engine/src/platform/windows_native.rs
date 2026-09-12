@@ -288,6 +288,7 @@ unsafe extern "C" {
     fn rd_nvenc_release_output(encoder: *mut RdNvencEncoder, loan: *const RdNvencOutputLoan)
     -> i32;
     fn rd_nvenc_shutdown(encoder: *mut RdNvencEncoder) -> i32;
+    fn rd_nvenc_set_bitrate(encoder: *mut RdNvencEncoder, bitrate_bps: u32) -> i32;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1054,6 +1055,23 @@ impl Drop for NativeNvencOpenQuarantine {
 impl DirectNvenc<NativeFrame> for NativeNvenc {
     fn capability(&self) -> &EncoderCapabilities {
         &self.capability
+    }
+
+    fn set_bitrate(&mut self, bitrate_bps: u32) -> Result<(), ProducerError> {
+        if bitrate_bps == 0 {
+            return Err(ProducerError::InvalidConfig);
+        }
+        let encoder = self.raw.ok_or(ProducerError::Closed)?;
+        if self.pending_output.is_some() || self.quarantined_frame.is_some() {
+            // The native side refuses mid-loan too; refusing here keeps the
+            // reason local instead of surfacing a driver error.
+            return Err(ProducerError::ReclamationUnconfirmed);
+        }
+        let status = unsafe { rd_nvenc_set_bitrate(encoder.as_ptr(), bitrate_bps) };
+        if status != NV_OK {
+            return Err(ProducerError::EncoderFailed);
+        }
+        Ok(())
     }
 
     fn encode_texture(

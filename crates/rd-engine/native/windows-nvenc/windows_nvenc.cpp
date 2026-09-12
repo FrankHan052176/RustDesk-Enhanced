@@ -44,6 +44,12 @@ struct rd_nvenc_encoder {
     uint32_t loan_picture_type = 0;
     std::vector<uint8_t> mastering;
     std::vector<uint8_t> light;
+    /* The configuration the session was initialized with. `NV_ENC_INITIALIZE_PARAMS`
+     * only points at it, so it has to outlive that call for a reconfigure to keep
+     * every setting except the one being changed. */
+    NV_ENC_CONFIG config{};
+    bool have_config = false;
+    uint32_t fps_num = 0, fps_den = 1;
 };
 
 static HMODULE load_nvenc() noexcept {
@@ -413,6 +419,10 @@ extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL rd_nvenc_create(void *devp
         ns = e->api.nvEncInitializeEncoder(e->session, &ip);
         if (ns == NV_ENC_SUCCESS) {
             e->initialized = true;
+            e->config = cfg;
+            e->have_config = true;
+            e->fps_num = d->fps_num;
+            e->fps_den = d->fps_den ? d->fps_den : 1;
         }
         if (ns != NV_ENC_SUCCESS) {
             rd_nvenc_status original = nvfail("nvEncInitializeEncoder", ns);
@@ -609,6 +619,63 @@ rd_nvenc_release_output(rd_nvenc_encoder *e, const rd_nvenc_output_loan *l) {
     e->loan_picture_type = 0;
     return RD_NVENC_OK;
 }
+extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL
+rd_nvenc_set_bitrate(rd_nvenc_encoder *e, uint32_t bitrate_bps) {
+    g_error[0] = 0;
+    if (!e) {
+        return fail(RD_NVENC_INVALID_ARGUMENT, "null encoder");
+    }
+    if (!e->initialized || !e->have_config) {
+        return fail(RD_NVENC_INVALID_ARGUMENT, "encoder is not initialized");
+    }
+    if (!bitrate_bps) {
+        return fail(RD_NVENC_INVALID_ARGUMENT, "bitrate must be non-zero");
+    }
+    if (e->loaned) {
+        return fail(RD_NVENC_BUSY, "output loan is still outstanding");
+    }
+    if (!e->api.nvEncReconfigureEncoder) {
+        return fail(RD_NVENC_UNSUPPORTED, "nvEncReconfigureEncoder is unavailable");
+    }
+    /* CBR moves as a unit: the average, the ceiling and the VBV buffer are sized
+     * together, so a busy frame cannot be starved by a buffer built for the old
+     * rate. */
+    NV_ENC_CONFIG cfg = e->config;
+    cfg.rcParams.averageBitRate = bitrate_bps;
+    cfg.rcParams.maxBitRate = bitrate_bps;
+    uint64_t vbv = (uint64_t)bitrate_bps * e->fps_den / e->fps_num;
+    cfg.rcParams.vbvBufferSize = (uint32_t)(vbv ? vbv : 1);
+    cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+
+    NV_ENC_RECONFIGURE_PARAMS rp{};
+    rp.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    rp.resetEncoder = 0;
+    rp.forceIDR = 0;
+    rp.reInitEncodeParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    rp.reInitEncodeParams.encodeGUID = e->codec;
+    rp.reInitEncodeParams.presetGUID = NV_ENC_PRESET_P1_GUID;
+    rp.reInitEncodeParams.encodeWidth = e->width;
+    rp.reInitEncodeParams.encodeHeight = e->height;
+    rp.reInitEncodeParams.darWidth = e->width;
+    rp.reInitEncodeParams.darHeight = e->height;
+    rp.reInitEncodeParams.frameRateNum = e->fps_num;
+    rp.reInitEncodeParams.frameRateDen = e->fps_den;
+    rp.reInitEncodeParams.enableEncodeAsync = 0;
+    rp.reInitEncodeParams.enablePTD = 1;
+    rp.reInitEncodeParams.maxEncodeWidth = e->width;
+    rp.reInitEncodeParams.maxEncodeHeight = e->height;
+    rp.reInitEncodeParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+    rp.reInitEncodeParams.encodeConfig = &cfg;
+
+    NVENCSTATUS ns = e->api.nvEncReconfigureEncoder(e->session, &rp);
+    if (ns != NV_ENC_SUCCESS) {
+        return nvfail("nvEncReconfigureEncoder", ns);
+    }
+    /* Only recorded once the driver accepted it, so a failed call leaves the
+     * stored configuration describing what is actually running. */
+    e->config = cfg;
+    return RD_NVENC_OK;
+}
 extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL rd_nvenc_shutdown(rd_nvenc_encoder *e) {
     g_error[0] = 0;
     if (!e) {
@@ -639,6 +706,10 @@ rd_nvenc_encode_texture(rd_nvenc_encoder *, void *, uint64_t, uint32_t, rd_nvenc
 }
 extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL
 rd_nvenc_release_output(rd_nvenc_encoder *, const rd_nvenc_output_loan *) {
+    return RD_NVENC_UNSUPPORTED;
+}
+extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL
+rd_nvenc_set_bitrate(rd_nvenc_encoder *, uint32_t) {
     return RD_NVENC_UNSUPPORTED;
 }
 extern "C" RD_NVENC_API rd_nvenc_status RD_NVENC_CALL rd_nvenc_shutdown(rd_nvenc_encoder *) {

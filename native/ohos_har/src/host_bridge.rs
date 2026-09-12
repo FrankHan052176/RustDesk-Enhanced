@@ -96,6 +96,10 @@ pub fn engine_host_start(width: f64, height: f64, fps: f64) -> Result<String> {
         height,
         fps,
         bitrate: 16_000_000,
+        // The OHOS publisher configures its encoder once per capture session and
+        // has no reconfiguration path, so a rate that followed the picture could
+        // not be applied. Stated rather than defaulted so the gap is visible.
+        bitrate_auto: false,
         platform: "HarmonyOS".into(),
         publisher_backend: PublisherBackend::Auto,
         output_index: 0,
