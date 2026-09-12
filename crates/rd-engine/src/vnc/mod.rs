@@ -731,6 +731,21 @@ mod live_tests {
     }
 }
 
+/// Read exactly `buffer.len()` bytes, or report that the client went away.
+///
+/// The scripted servers answer one client and assert nothing about what that
+/// client sent, so a short read means the test finished and closed the socket.
+/// Returning `false` instead of failing keeps the servers from turning a
+/// finished test into a panic -- which is what happened on Windows, where
+/// `read_exact` reports the close as an error rather than blocking.
+fn read_or_eof(stream: &mut TcpStream, buffer: &mut [u8]) -> bool {
+    use std::io::Read;
+    match stream.read_exact(buffer) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,11 +784,15 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.889\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             assert_eq!(&answer, protocol::PROTOCOL_VERSION_3_8);
             stream.write_all(&[1, 1]).expect("security: None");
             let mut choice = [0u8; 1];
-            stream.read_exact(&mut choice).expect("choice");
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
             assert_eq!(choice[0], 1);
             stream
                 .write_all(&SECURITY_RESULT_OK.to_be_bytes())
@@ -781,12 +800,14 @@ mod tests {
             write_server_init(&mut stream, 1024, 768, "test");
             // Read the pixel format and encodings the client sends.
             let mut set_format = [0u8; 20];
-            stream.read_exact(&mut set_format).expect("set format");
+            if !read_or_eof(&mut stream, &mut set_format) {
+                return;
+            }
             assert_eq!(set_format[0], protocol::C2S_SET_PIXEL_FORMAT);
             let mut encodings_header = [0u8; 4];
-            stream
-                .read_exact(&mut encodings_header)
-                .expect("encodings header");
+            if !read_or_eof(&mut stream, &mut encodings_header) {
+                return;
+            }
             assert_eq!(encodings_header[0], protocol::C2S_SET_ENCODINGS);
         });
 
@@ -808,7 +829,9 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.889\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             // Apple Remote Desktop, Apple Diffie-Hellman, and one unknown type.
             stream.write_all(&[3, 30, 33, 19]).expect("security list");
         });
@@ -826,16 +849,22 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.008\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             // None first, then VNC authentication: the client must not take the
             // unauthenticated option when it has a password.
             stream.write_all(&[2, 1, 2]).expect("security list");
             let mut choice = [0u8; 1];
-            stream.read_exact(&mut choice).expect("choice");
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
             assert_eq!(choice[0], 2, "client chose the weaker security type");
             stream.write_all(&[0u8; 16]).expect("challenge");
             let mut response = [0u8; 16];
-            stream.read_exact(&mut response).expect("response");
+            if !read_or_eof(&mut stream, &mut response) {
+                return;
+            }
             assert_ne!(response, [0u8; 16], "response was not encrypted");
             stream
                 .write_all(&SECURITY_RESULT_OK.to_be_bytes())
@@ -858,13 +887,19 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.008\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             stream.write_all(&[1, 2]).expect("security list");
             let mut choice = [0u8; 1];
-            stream.read_exact(&mut choice).expect("choice");
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
             stream.write_all(&[0u8; 16]).expect("challenge");
             let mut response = [0u8; 16];
-            stream.read_exact(&mut response).expect("response");
+            if !read_or_eof(&mut stream, &mut response) {
+                return;
+            }
             stream
                 .write_all(&SECURITY_RESULT_FAILED.to_be_bytes())
                 .expect("result");
@@ -891,13 +926,19 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.008\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             stream.write_all(&[1, 2]).expect("security list");
             let mut choice = [0u8; 1];
-            stream.read_exact(&mut choice).expect("choice");
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
             stream.write_all(&[0u8; 16]).expect("challenge");
             let mut response = [0u8; 16];
-            stream.read_exact(&mut response).expect("response");
+            if !read_or_eof(&mut stream, &mut response) {
+                return;
+            }
             // Apple screen sharing sends failure as 01 00 00 00.
             stream.write_all(&[0x01, 0x00, 0x00, 0x00]).expect("result");
             let reason = b"Authentication failure";
@@ -922,10 +963,14 @@ mod tests {
         let (address, server) = run_against_script(|mut stream| {
             stream.write_all(b"RFB 003.008\n").expect("banner");
             let mut answer = [0u8; 12];
-            stream.read_exact(&mut answer).expect("version answer");
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
             stream.write_all(&[1, 1]).expect("security list");
             let mut choice = [0u8; 1];
-            stream.read_exact(&mut choice).expect("choice");
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
             stream
                 .write_all(&SECURITY_RESULT_OK.to_be_bytes())
                 .expect("result");
