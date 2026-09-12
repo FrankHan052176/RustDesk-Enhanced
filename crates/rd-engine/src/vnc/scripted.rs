@@ -142,42 +142,47 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     // here and failed on Windows. The loop therefore ends when the peer closes,
     // not on a timer. The timeout only exists so a client that goes quiet without
     // closing cannot pin the thread; a quiet connection is not an exit.
+    // Keep reading client messages for as long as the client is there.
+    //
+    // A server that stops reading makes the client's writes fail, which is what
+    // turned two input tests red on Windows and green here. The loop ends when
+    // the peer closes, not on a timer: a fixed window was longer than the test it
+    // was written for and shorter than a slower machine takes.
+    //
+    // Reading with a timeout rather than peeking is deliberate. `peek` on a
+    // socket with a read timeout behaves differently across platforms, and a
+    // wrong answer there aborts the connection instead of waiting.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    // Everything this server was asked to do has been done, so a client that now
-    // says nothing is satisfied rather than slow: waiting for more input would
-    // deadlock against a client that is waiting for the frame already sent.
-    let grace = std::time::Duration::from_secs(2);
-    let sent_at = std::time::Instant::now();
+    // The server has done everything it was asked to, so a client that now says
+    // nothing is satisfied rather than slow: waiting forever would deadlock
+    // against a client reading the frame that was already sent.
+    // Liveness, not a deadline. The server exits when the peer closes, and the
+    // only timer is how long it tolerates silence *after the last thing it
+    // heard*: a client that is still working keeps resetting it, so a slow
+    // machine is served as long as it needs and a finished test closes the socket
+    // and ends the thread at once. A single deadline from the last send was the
+    // same machine-dependent timer in a different disguise.
+    let idle_limit = std::time::Duration::from_secs(10);
+    let mut last_heard = std::time::Instant::now();
     loop {
-        let idle_since = std::time::Instant::now();
-        loop {
-            if idle_since.elapsed() > std::time::Duration::from_secs(60) {
-                return;
-            }
-            let mut probe = [0u8; 1];
-            match stream.peek(&mut probe) {
-                // Something arrived, so fall through to read it.
-                Ok(_) => break,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if sent_at.elapsed() > grace {
-                        return;
-                    }
-                    continue;
-                }
-                // The peer closed, so the conversation is over.
-                Err(_) => return,
-            }
-        }
         let mut header = [0u8; 1];
-        if stream.read_exact(&mut header).is_err() {
-            // The peek said a byte was ready, so a failure here is a real one.
-            return;
+        match stream.read(&mut header) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if last_heard.elapsed() > idle_limit {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => return,
         }
+        last_heard = std::time::Instant::now();
         let rest = match header[0] {
             // SetPixelFormat, SetEncodings and FramebufferUpdateRequest.
             0 => 19,
