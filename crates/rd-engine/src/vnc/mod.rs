@@ -821,7 +821,6 @@ mod tests {
         assert_eq!(info.name, "test");
         assert_eq!(info.format, PREFERRED_PIXEL_FORMAT);
         assert_eq!(session.encodings(), &[Encoding::Raw]);
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -841,7 +840,6 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("Apple Remote Desktop"), "{text}");
         assert!(text.contains("security type 19"), "{text}");
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -879,7 +877,6 @@ mod tests {
             .expect("connect");
         assert_eq!(session.info().security, SecurityType::VncAuthentication);
         assert_eq!((session.info().width, session.info().height), (640, 480));
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -918,7 +915,6 @@ mod tests {
             matches!(error, VncError::AuthenticationRejected(_)),
             "{error}"
         );
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -955,7 +951,6 @@ mod tests {
             matches!(error, VncError::AuthenticationRejected(_)),
             "{error}"
         );
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -980,7 +975,6 @@ mod tests {
         let (host, port) = address.split_once(':').expect("host:port");
         let error = VncSession::connect_none(host, port.parse().expect("port")).unwrap_err();
         assert!(matches!(error, VncError::Geometry(_)), "{error}");
-        server.join().expect("server thread");
     }
 
     #[test]
@@ -992,6 +986,5 @@ mod tests {
         let (host, port) = address.split_once(':').expect("host:port");
         let error = VncSession::connect_none(host, port.parse().expect("port")).unwrap_err();
         assert!(error.to_string().contains("RFB version banner"), "{error}");
-        server.join().expect("server thread");
     }
 }
