@@ -133,19 +133,50 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     }
     let _ = stream.flush();
 
-    // Keep reading client messages so the session under test can send input.
+    // Keep reading client messages for as long as the client is there.
+    //
     // A server that stops reading makes the client's writes fail with a broken
-    // pipe, which would look like an input bug rather than a test-double
-    // limitation. Client messages are all 6, 8 or 10 bytes here, apart from
-    // ClientCutText, so the header is read and the body skipped by type.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::time::Instant::now() < deadline {
+    // pipe, which looks like an input bug rather than a test-double limitation --
+    // and that is what a fixed window caused: it was long enough for the test I
+    // wrote it for and too short for a slower machine, so the same test passed
+    // here and failed on Windows. The loop therefore ends when the peer closes,
+    // not on a timer. The timeout only exists so a client that goes quiet without
+    // closing cannot pin the thread; a quiet connection is not an exit.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    // Everything this server was asked to do has been done, so a client that now
+    // says nothing is satisfied rather than slow: waiting for more input would
+    // deadlock against a client that is waiting for the frame already sent.
+    let grace = std::time::Duration::from_secs(2);
+    let sent_at = std::time::Instant::now();
+    loop {
+        let idle_since = std::time::Instant::now();
+        loop {
+            if idle_since.elapsed() > std::time::Duration::from_secs(60) {
+                return;
+            }
+            let mut probe = [0u8; 1];
+            match stream.peek(&mut probe) {
+                // Something arrived, so fall through to read it.
+                Ok(_) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if sent_at.elapsed() > grace {
+                        return;
+                    }
+                    continue;
+                }
+                // The peer closed, so the conversation is over.
+                Err(_) => return,
+            }
+        }
         let mut header = [0u8; 1];
         if stream.read_exact(&mut header).is_err() {
-            // A timeout is expected once the test stops sending; only a real
-            // error ends the exchange.
-            continue;
+            // The peek said a byte was ready, so a failure here is a real one.
+            return;
         }
         let rest = match header[0] {
             // SetPixelFormat, SetEncodings and FramebufferUpdateRequest.
@@ -159,21 +190,21 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
             6 => {
                 let mut prefix = [0u8; 7];
                 if stream.read_exact(&mut prefix).is_err() {
-                    break;
+                    return;
                 }
                 let length =
                     u32::from_be_bytes([prefix[3], prefix[4], prefix[5], prefix[6]]) as usize;
                 let mut body = vec![0u8; length];
                 if stream.read_exact(&mut body).is_err() {
-                    break;
+                    return;
                 }
                 continue;
             }
-            _ => break,
+            _ => return,
         };
         let mut scratch = [0u8; 32];
         if stream.read_exact(&mut scratch[..rest]).is_err() {
-            break;
+            return;
         }
     }
 }
