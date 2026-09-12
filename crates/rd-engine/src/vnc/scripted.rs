@@ -62,6 +62,39 @@ impl Drop for ScriptedServer {
     }
 }
 
+/// Read exactly `buffer.len()` bytes, waiting out a socket timeout.
+///
+/// Returns `false` only when the peer is gone or has been silent past
+/// `idle_limit`. A message may arrive in more than one segment, and a timeout
+/// between segments is not the client finishing, so a timed-out read is retried
+/// rather than treated as the end of the conversation. Getting that wrong is what
+/// made these tests pass locally and fail elsewhere: the server gave up between
+/// two segments and the client's next write hit a broken pipe.
+fn read_waiting(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    last_heard: &mut std::time::Instant,
+    idle_limit: std::time::Duration,
+) -> bool {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => return false,
+            Ok(read) => {
+                filled += read;
+                *last_heard = std::time::Instant::now();
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                if last_heard.elapsed() > idle_limit {
+                    return false;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    true
+}
+
 fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     // Version exchange. 3.8 keeps the handshake on the simplest path.
     stream.write_all(b"RFB 003.008\n").expect("banner");
@@ -166,23 +199,9 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     let mut last_heard = std::time::Instant::now();
     loop {
         let mut header = [0u8; 1];
-        match stream.read(&mut header) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if last_heard.elapsed() > idle_limit {
-                    return;
-                }
-                continue;
-            }
-            Err(_) => return,
+        if !read_waiting(stream, &mut header, &mut last_heard, idle_limit) {
+            return;
         }
-        last_heard = std::time::Instant::now();
         let rest = match header[0] {
             // SetPixelFormat, SetEncodings and FramebufferUpdateRequest.
             0 => 19,
@@ -194,13 +213,13 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
             // ClientCutText: three padding bytes, then a length and the body.
             6 => {
                 let mut prefix = [0u8; 7];
-                if stream.read_exact(&mut prefix).is_err() {
+                if !read_waiting(stream, &mut prefix, &mut last_heard, idle_limit) {
                     return;
                 }
                 let length =
                     u32::from_be_bytes([prefix[3], prefix[4], prefix[5], prefix[6]]) as usize;
                 let mut body = vec![0u8; length];
-                if stream.read_exact(&mut body).is_err() {
+                if !read_waiting(stream, &mut body, &mut last_heard, idle_limit) {
                     return;
                 }
                 continue;
@@ -208,7 +227,7 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
             _ => return,
         };
         let mut scratch = [0u8; 32];
-        if stream.read_exact(&mut scratch[..rest]).is_err() {
+        if !read_waiting(stream, &mut scratch[..rest], &mut last_heard, idle_limit) {
             return;
         }
     }
