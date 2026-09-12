@@ -529,9 +529,7 @@ fn worker_main(
     // what a flickering picture looks like.
     let adapt_rate = config.auto_bitrate;
     let mut bitrate = crate::windows_bitrate::BitrateController::new(
-        crate::windows_bitrate::StreamShape {
-            fps: config.fps_numerator.get(),
-        },
+        crate::windows_bitrate::StreamShape { fps: config.fps },
         config.bitrate as i64,
     );
     let run_error = loop {
