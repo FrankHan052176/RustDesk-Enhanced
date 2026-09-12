@@ -19,6 +19,7 @@
 //! implementation and is called out here rather than left to be discovered: the
 //! alternative is splitting the socket into read/write halves.
 
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -56,6 +57,18 @@ struct Counters {
 
 /// A connected VNC session.
 pub struct VncLiveSession {
+    /// The writing side, used only for client-to-server messages.
+    ///
+    /// It is a separate handle to the same socket as the reader's, and that is
+    /// what makes input work at all. An earlier version kept one handle behind a
+    /// mutex so the two sides could not interleave; because the reader blocks in
+    /// `read` while holding that mutex, every pointer and key event then waited
+    /// for the server to send something, which for an idle VNC desktop is
+    /// never. Input appeared to hang rather than to fail, which is worse.
+    /// `TcpStream` is safe to clone for this: the socket keeps one send queue,
+    /// and writes of these fixed, short messages do not interleave.
+    writer: TcpStream,
+    /// The reading side, owned by the reader thread.
     inner: Arc<Mutex<VncSession>>,
     shared: Arc<(Mutex<Shared>, Condvar)>,
     counters: Arc<Counters>,
@@ -99,6 +112,11 @@ impl VncLiveSession {
             None => VncSession::connect_none(host, port)?,
         };
         let info = session.info().clone();
+        // Taken before the session is wrapped: the reader will hold the mutex for
+        // as long as it is waiting, so the close path cannot go through it.
+        let writer = session
+            .try_clone_socket()
+            .map_err(|error| VncError::io("clone socket", error))?;
         // The server may answer with a format other than the one requested, and
         // 16-bit or big-endian servers are common, so pixels are decoded with
         // what it reported rather than assumed to be the requested layout.
@@ -106,6 +124,7 @@ impl VncLiveSession {
         let width = u32::from(info.width);
         let height = u32::from(info.height);
         let session = Self {
+            writer,
             inner: Arc::new(Mutex::new(session)),
             shared: Arc::new((Mutex::new(Shared::default()), Condvar::new())),
             counters: Arc::new(Counters::default()),
@@ -206,26 +225,38 @@ impl VncLiveSession {
 
     /// Send pointer state. Coordinates are framebuffer pixels.
     pub fn send_mouse(&self, buttons: u8, x: u16, y: u16) -> Result<(), VncError> {
-        let mut session = lock(&self.inner);
-        session.send_pointer(buttons, x, y)
+        let (width, height) = (self.width(), self.height());
+        if x >= width || y >= height {
+            return Err(VncError::geometry(format!(
+                "pointer ({x},{y}) is outside the {width}x{height} framebuffer"
+            )));
+        }
+        write_all(
+            &self.writer,
+            &crate::vnc::protocol::encode_pointer_event(buttons, x, y),
+        )
     }
 
     /// Send a key press or release as an X11 keysym.
     pub fn send_key(&self, down: bool, keysym: u32) -> Result<(), VncError> {
-        let mut session = lock(&self.inner);
-        session.send_key(down, keysym)
+        write_all(
+            &self.writer,
+            &crate::vnc::protocol::encode_key_event(down, keysym),
+        )
     }
 
     /// Send clipboard text to the server.
     pub fn send_clipboard(&self, text: &str) -> Result<(), VncError> {
-        let mut session = lock(&self.inner);
-        session.send_clipboard(text)
+        let message = crate::vnc::protocol::encode_client_cut_text(text)?;
+        write_all(&self.writer, &message)
     }
 
     /// Ask for a full repaint, which is how a VNC session refreshes.
     pub fn refresh(&self) -> Result<(), VncError> {
-        let mut session = lock(&self.inner);
-        session.request_full_update()
+        let (width, height) = (self.width(), self.height());
+        let request =
+            crate::vnc::protocol::encode_framebuffer_update_request(false, 0, 0, width, height);
+        write_all(&self.writer, &request)
     }
 
     /// Change the forced capture rate.
@@ -252,10 +283,9 @@ impl VncLiveSession {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Shutting the write side is enough to make the blocked read return on
-        // every platform this engine targets.
-        let session = lock(&self.inner);
-        let _ = (&*session).shutdown();
+        // Shut down through the separate handle: taking the session mutex here
+        // would wait for the reader, and the reader is waiting for this shutdown.
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 
     fn spawn_reader(&self) -> JoinHandle<()> {
@@ -521,6 +551,15 @@ fn fill_solid(
             framebuffer[target + 3] = 0xFF;
         }
     }
+}
+
+/// Write a complete client message.
+fn write_all(stream: &TcpStream, bytes: &[u8]) -> Result<(), VncError> {
+    use std::io::Write;
+    let mut stream = stream;
+    stream
+        .write_all(bytes)
+        .map_err(|error| VncError::io("client message", error))
 }
 
 /// Lock a mutex, treating poisoning as recoverable: a panic in one path must not

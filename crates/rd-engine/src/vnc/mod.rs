@@ -559,6 +559,12 @@ impl VncSession {
             .map_err(|error| VncError::io("key event", error))
     }
 
+    /// A second handle to the same socket, for a close path that cannot take the
+    /// session lock because the reader holds it.
+    pub fn try_clone_socket(&self) -> std::io::Result<TcpStream> {
+        self.stream.try_clone()
+    }
+
     /// Shut the connection down so a blocked read returns.
     ///
     /// The reader thread spends its life inside `read`, so a close has to break
@@ -660,7 +666,6 @@ mod live_tests {
         assert!(!snapshot.closed);
 
         session.close();
-        server.join();
     }
 
     #[test]
@@ -672,7 +677,6 @@ mod live_tests {
         // unchanged picture at the frontend's polling rate is wasted work.
         assert!(session.take_frame().is_none());
         session.close();
-        server.join();
     }
 
     #[test]
@@ -680,7 +684,6 @@ mod live_tests {
         let server = ScriptedServer::start(sample_frame());
         let session = VncLiveSession::open("127.0.0.1", server.port, None, true).expect("open");
         assert!(wait_for_frame(&session).is_some());
-
         session.send_mouse(0, 1, 1).expect("pointer inside");
         session.send_key(true, 0x61).expect("key press");
         session.send_key(false, 0x61).expect("key release");
@@ -691,7 +694,6 @@ mod live_tests {
         );
 
         session.close();
-        server.join();
     }
 
     #[test]
@@ -713,7 +715,6 @@ mod live_tests {
         }
         // Closing twice is harmless.
         session.close();
-        server.join();
     }
 
     #[test]
@@ -727,7 +728,6 @@ mod live_tests {
         assert!(session.set_requested_fps(0).is_err());
         assert!(session.set_requested_fps(241).is_err());
         session.close();
-        server.join();
     }
 }
 

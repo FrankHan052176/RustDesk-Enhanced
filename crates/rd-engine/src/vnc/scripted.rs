@@ -23,9 +23,14 @@ pub struct ScriptedFrame {
 }
 
 /// A running scripted server.
+///
+/// The thread is detached rather than joined. Joining it would wait for the
+/// client to close, and a test closes its session *after* the server handle goes
+/// out of scope -- so joining from `Drop` waits for the teardown that has not
+/// happened yet. The client closing its side is what ends the thread, and nothing
+/// in a test needs to observe that.
 pub struct ScriptedServer {
     pub port: u16,
-    handle: Option<JoinHandle<()>>,
 }
 
 impl ScriptedServer {
@@ -34,48 +39,30 @@ impl ScriptedServer {
     pub fn start(frame: ScriptedFrame) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted server");
         let port = listener.local_addr().expect("addr").port();
-        let handle = thread::spawn(move || {
+        thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             stream.set_nodelay(true).expect("nodelay");
             serve(&mut stream, frame);
         });
-        Self {
-            port,
-            handle: Some(handle),
-        }
-    }
-
-    /// Wait for the scripted server to finish serving one client.
-    pub fn join(mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for ScriptedServer {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            // The client may have gone away; the test still owns the assertion.
-            let _ = handle.join();
-        }
+        Self { port }
     }
 }
 
 /// Read exactly `buffer.len()` bytes, waiting out a socket timeout.
 ///
-/// Returns `false` only when the peer is gone or has been silent past
-/// `idle_limit`. A message may arrive in more than one segment, and a timeout
-/// between segments is not the client finishing, so a timed-out read is retried
-/// rather than treated as the end of the conversation. Getting that wrong is what
-/// made these tests pass locally and fail elsewhere: the server gave up between
-/// two segments and the client's next write hit a broken pipe.
+/// Returns `false` when the peer closes or the overall limit passes. A message
+/// may arrive in more than one segment, so this loops rather than assuming one
+/// read finishes it. An error that is not a close is retried: the platforms
+/// disagree about which kind a timed-out receive is, and this server does not
+/// need to tell them apart -- a client that is still working counts as progress,
+/// and a client that left is recognised by the zero-length read.
 fn read_waiting(
     stream: &mut TcpStream,
     buffer: &mut [u8],
     last_heard: &mut std::time::Instant,
-    idle_limit: std::time::Duration,
+    overall_limit: std::time::Duration,
 ) -> bool {
+    let started = *last_heard;
     let mut filled = 0;
     while filled < buffer.len() {
         match stream.read(&mut buffer[filled..]) {
@@ -85,7 +72,7 @@ fn read_waiting(
                 *last_heard = std::time::Instant::now();
             }
             Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
-                if last_heard.elapsed() > idle_limit {
+                if started.elapsed() > overall_limit {
                     return false;
                 }
             }
@@ -95,22 +82,46 @@ fn read_waiting(
     true
 }
 
+/// Close in a way the peer reads as a close.
+///
+/// Dropping the socket is not equivalent: the client saw an abrupt drop as
+/// `ConnectionAborted` on Windows rather than a clean end of stream, which turned
+/// a finished test into a failed input write.
+fn close_orderly(stream: &TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
+    // Every step below can find the client already gone, which is normal: a test
+    // asserting a refusal closes as soon as it has its answer. A server that
+    // treats that as an error turns a passing test into a failing one, so each
+    // read reports the close and the function returns after closing in a way the
+    // peer reads as a close rather than an abrupt drop.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let mut last_heard = std::time::Instant::now();
+    let overall_limit = std::time::Duration::from_secs(600);
+
     // Version exchange. 3.8 keeps the handshake on the simplest path.
-    stream.write_all(b"RFB 003.008\n").expect("banner");
+    if stream.write_all(b"RFB 003.008\n").is_err() {
+        return;
+    }
     let mut answer = [0u8; 12];
-    if stream.read_exact(&mut answer).is_err() {
+    if !read_waiting(stream, &mut answer, &mut last_heard, overall_limit) {
+        close_orderly(stream);
         return;
     }
     // One security type: None.
-    stream.write_all(&[1, 1]).expect("security list");
-    let mut choice = [0u8; 1];
-    if stream.read_exact(&mut choice).is_err() {
+    if stream.write_all(&[1, 1]).is_err() {
         return;
     }
-    stream
-        .write_all(&0u32.to_be_bytes())
-        .expect("security result");
+    let mut choice = [0u8; 1];
+    if !read_waiting(stream, &mut choice, &mut last_heard, overall_limit) {
+        close_orderly(stream);
+        return;
+    }
+    if stream.write_all(&0u32.to_be_bytes()).is_err() {
+        return;
+    }
 
     // ServerInit with the client's preferred pixel format.
     let mut body = Vec::new();
@@ -120,25 +131,41 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     let name = b"scripted";
     body.extend_from_slice(&(name.len() as u32).to_be_bytes());
     body.extend_from_slice(name);
-    stream.write_all(&body).expect("server init");
+    if stream.write_all(&body).is_err() {
+        return;
+    }
 
-    // Client messages: SetPixelFormat (20 bytes), SetEncodings (variable), then
-    // FramebufferUpdateRequest (10 bytes).
+    // The client's opening messages: SetPixelFormat, SetEncodings, then a
+    // FramebufferUpdateRequest.
     let mut set_pixel_format = [0u8; 20];
-    if stream.read_exact(&mut set_pixel_format).is_err() {
+    if !read_waiting(
+        stream,
+        &mut set_pixel_format,
+        &mut last_heard,
+        overall_limit,
+    ) {
+        close_orderly(stream);
         return;
     }
     let mut encodings_header = [0u8; 4];
-    if stream.read_exact(&mut encodings_header).is_err() {
+    if !read_waiting(
+        stream,
+        &mut encodings_header,
+        &mut last_heard,
+        overall_limit,
+    ) {
+        close_orderly(stream);
         return;
     }
     let count = u16::from_be_bytes([encodings_header[2], encodings_header[3]]) as usize;
     let mut encodings = vec![0u8; count * 4];
-    if stream.read_exact(&mut encodings).is_err() {
+    if !read_waiting(stream, &mut encodings, &mut last_heard, overall_limit) {
+        close_orderly(stream);
         return;
     }
     let mut request = [0u8; 10];
-    if stream.read_exact(&mut request).is_err() {
+    if !read_waiting(stream, &mut request, &mut last_heard, overall_limit) {
+        close_orderly(stream);
         return;
     }
 
@@ -166,69 +193,32 @@ fn serve(stream: &mut TcpStream, frame: ScriptedFrame) {
     }
     let _ = stream.flush();
 
-    // Keep reading client messages for as long as the client is there.
-    //
-    // A server that stops reading makes the client's writes fail with a broken
-    // pipe, which looks like an input bug rather than a test-double limitation --
-    // and that is what a fixed window caused: it was long enough for the test I
-    // wrote it for and too short for a slower machine, so the same test passed
-    // here and failed on Windows. The loop therefore ends when the peer closes,
-    // not on a timer. The timeout only exists so a client that goes quiet without
-    // closing cannot pin the thread; a quiet connection is not an exit.
-    // Keep reading client messages for as long as the client is there.
-    //
-    // A server that stops reading makes the client's writes fail, which is what
-    // turned two input tests red on Windows and green here. The loop ends when
-    // the peer closes, not on a timer: a fixed window was longer than the test it
-    // was written for and shorter than a slower machine takes.
-    //
-    // Reading with a timeout rather than peeking is deliberate. `peek` on a
-    // socket with a read timeout behaves differently across platforms, and a
-    // wrong answer there aborts the connection instead of waiting.
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    // The server has done everything it was asked to, so a client that now says
-    // nothing is satisfied rather than slow: waiting forever would deadlock
-    // against a client reading the frame that was already sent.
-    // Liveness, not a deadline. The server exits when the peer closes, and the
-    // only timer is how long it tolerates silence *after the last thing it
-    // heard*: a client that is still working keeps resetting it, so a slow
-    // machine is served as long as it needs and a finished test closes the socket
-    // and ends the thread at once. A single deadline from the last send was the
-    // same machine-dependent timer in a different disguise.
-    let idle_limit = std::time::Duration::from_secs(10);
-    let mut last_heard = std::time::Instant::now();
+    // Keep reading for as long as the client is there, so its input writes
+    // succeed. The server has already done everything it was asked to, so this
+    // exists only to stay alive: it drains whatever arrives and stops when the
+    // peer closes. Draining rather than parsing is deliberate -- nothing here
+    // asserts anything about these bytes, and parsing them is what produced four
+    // rounds of platform-specific failures.
+    let mut scratch = [0u8; 4096];
     loop {
-        let mut header = [0u8; 1];
-        if !read_waiting(stream, &mut header, &mut last_heard, idle_limit) {
-            return;
-        }
-        let rest = match header[0] {
-            // SetPixelFormat, SetEncodings and FramebufferUpdateRequest.
-            0 => 19,
-            2 => 3,
-            3 => 9,
-            // KeyEvent and PointerEvent.
-            4 => 7,
-            5 => 5,
-            // ClientCutText: three padding bytes, then a length and the body.
-            6 => {
-                let mut prefix = [0u8; 7];
-                if !read_waiting(stream, &mut prefix, &mut last_heard, idle_limit) {
-                    return;
-                }
-                let length =
-                    u32::from_be_bytes([prefix[3], prefix[4], prefix[5], prefix[6]]) as usize;
-                let mut body = vec![0u8; length];
-                if !read_waiting(stream, &mut body, &mut last_heard, idle_limit) {
-                    return;
-                }
-                continue;
+        match stream.read(&mut scratch) {
+            Ok(0) => {
+                close_orderly(stream);
+                return;
             }
-            _ => return,
-        };
-        let mut scratch = [0u8; 32];
-        if !read_waiting(stream, &mut scratch[..rest], &mut last_heard, idle_limit) {
-            return;
+            Ok(_) => {
+                last_heard = std::time::Instant::now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                // A timed-out receive is not the client leaving; the platforms
+                // disagree about which error kind it is, so only a long silence
+                // ends the loop.
+                if last_heard.elapsed() > std::time::Duration::from_secs(600) {
+                    close_orderly(stream);
+                    return;
+                }
+            }
         }
     }
 }

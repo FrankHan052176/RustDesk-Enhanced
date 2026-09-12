@@ -659,7 +659,6 @@ mod tests {
         assert!(!snapshot.peer_verified);
         assert!(!snapshot.closed);
         backend.request_close();
-        server.join();
     }
 
     #[test]
@@ -680,7 +679,6 @@ mod tests {
         assert_eq!(info.displays[0].height, 3);
         assert_eq!(info.current_display, 0);
         backend.request_close();
-        server.join();
     }
 
     #[test]
@@ -694,7 +692,6 @@ mod tests {
         assert_eq!(&pixels[0..4], &[0x11, 0x22, 0x33, 0xFF]);
         assert_eq!(&pixels[4..8], &[0x44, 0x55, 0x66, 0xFF]);
         backend.request_close();
-        server.join();
     }
 
     #[test]
@@ -733,7 +730,6 @@ mod tests {
         assert!(backend.switch_display(1, 0, 0).is_err());
         assert!(backend.switch_display(0, 0, 0).is_ok());
         backend.request_close();
-        server.join();
     }
 
     #[test]
@@ -749,7 +745,6 @@ mod tests {
         assert_eq!(backend.snapshot().requested_fps, 0);
         assert!(backend.set_requested_fps(0).is_err());
         backend.request_close();
-        server.join();
     }
 
     #[test]
@@ -781,6 +776,5 @@ mod tests {
         let translated = backend.send_text("中".to_owned()).unwrap_err().to_string();
         assert!(translated.contains("Latin-1"), "{translated}");
         backend.request_close();
-        server.join();
     }
 }
