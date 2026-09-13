@@ -5,7 +5,7 @@
 use crate::{
     authentication::{
         Approval, ApprovalProvider, AttemptPolicy, HostAuthConfig, NoSecondFactor, Passwords,
-        Permissions, PrimaryPolicy,
+        Permissions, PrimaryPolicy, salted_password,
     },
     handshake::{HostIdentity, Security},
     input::{InputAction, decode_message},
@@ -14,10 +14,12 @@ use crate::{
     transport::{WireReader, WireWriter},
 };
 use hbb_common::{
+    config::{Config, decode_permanent_password_h1_from_storage},
     message_proto::{
         self as proto, DisplayInfo, EncodedVideoFrame, EncodedVideoFrames, LoginRequest, Message,
         PeerInfo, SupportedEncoding, VideoFrame, message, misc, supported_decoding::PreferCodec,
     },
+    password_security::{self, ApproveMode},
     sodiumoxide::{self, crypto::sign},
 };
 use std::{
@@ -116,6 +118,22 @@ pub struct HostSnapshot {
     /// removed rather than half-implemented, and the counter makes the removal
     /// visible instead of silent.
     pub dropped_chat_messages: u64,
+    /// Input records dropped because this session has no injection permission or
+    /// no platform sink. The session stays up: the original host skips the
+    /// injection and keeps the connection, and a close here turns a controller's
+    /// mouse move into a reconnect and a fresh password prompt.
+    pub dropped_inputs: u64,
+    /// Display requests this single-display host cannot honour. Counted, not
+    /// fatal, for the same reason.
+    pub ignored_display_requests: u64,
+    /// How often the platform recorder had to be reopened during this session.
+    /// A recorder restart stays inside the session, so this counter is the only
+    /// trace of it in the host's own state.
+    pub capture_restarts: u64,
+    /// Whether the peer currently subscribes to this host's display. An
+    /// unsubscribe stops the video stream without ending the session, which is
+    /// what the original host does when a controller switches displays.
+    pub video_subscribed: bool,
     pub closed: bool,
 }
 
@@ -196,6 +214,10 @@ impl Host {
                 injected_inputs: 0,
                 refused_inputs: 0,
                 dropped_chat_messages: 0,
+                dropped_inputs: 0,
+                ignored_display_requests: 0,
+                capture_restarts: 0,
+                video_subscribed: true,
                 closed: false,
             }),
         });
@@ -305,6 +327,49 @@ struct Encoders {
 /// platform sink; either one missing leaves the peer without input. Nothing else
 /// is granted here, so the ceiling, the approval grant and the wire
 /// advertisement all agree by construction.
+/// The passwords this host accepts, from the sources the original host uses.
+///
+/// The one-time password is plaintext in memory, so it is salted with the salt
+/// this session announces, which is what a client's first hash is built against.
+/// The permanent password is stored as a finished first hash tied to its own
+/// preset salt, so accepting it means announcing that salt instead; that storage
+/// is not wired in yet.
+fn host_passwords(
+    salt: &str,
+    temporary: &str,
+    permanent: Option<[u8; 32]>,
+    allow_permanent: bool,
+    allow_temporary: bool,
+) -> Vec<[u8; 32]> {
+    let mut values = Vec::new();
+    // The stored hash is already the first half of the chain, tied to the salt
+    // this session announces.
+    if allow_permanent {
+        if let Some(h1) = permanent {
+            values.push(h1);
+        }
+    }
+    if allow_temporary && !temporary.is_empty() {
+        values.push(salted_password(temporary.as_bytes(), salt));
+    }
+    values
+}
+
+/// The stored permanent password's first hash, when the operator set one.
+fn permanent_password_h1() -> Option<[u8; 32]> {
+    let (storage, _) = Config::get_local_permanent_password_storage_and_salt();
+    decode_permanent_password_h1_from_storage(&storage)
+}
+
+/// The approval policy the operator configured, in this host's vocabulary.
+fn host_policy(mode: ApproveMode) -> PrimaryPolicy {
+    match mode {
+        ApproveMode::Password => PrimaryPolicy::PasswordOnly,
+        ApproveMode::Click => PrimaryPolicy::ClickOnly,
+        ApproveMode::Both => PrimaryPolicy::PasswordOrClick,
+    }
+}
+
 fn local_permissions(options: &HostOptions) -> Permissions {
     Permissions {
         keyboard: options.input_injection && options.input_sink.is_some(),
@@ -420,10 +485,61 @@ async fn serve(state: Arc<State>, options: HostOptions) -> Result<(), HostError>
         if let Err(error) = outcome {
             state.update(|s| s.error = Some(error));
             if error == HostError::ReclamationUnconfirmed {
+                // Quarantine: native ownership could not be confirmed, so no new
+                // session is accepted. The phase says so instead of leaving a
+                // listener that answers and then drops every peer, because a
+                // local operator restarts a host that reports stopped.
+                state.update(|s| s.phase = "stopped");
                 return Err(error);
             }
         }
     }
+}
+
+/// Every spelling of this machine that a peer may put in a login request's
+/// `username`.
+///
+/// The login check is an exact string match, so the list has to carry the forms
+/// a client actually sends. The original client's direct connection sends the
+/// address it was given, not this socket's local address -- and with
+/// `--listen 0.0.0.0:21118` that local address is `0.0.0.0:21118`, which no
+/// client ever sends. Listing only the configured id and the socket's own
+/// spelling rejected every real peer with "Offline" before it could present a
+/// password.
+fn accepted_targets(options: &HostOptions, local: SocketAddr) -> Vec<String> {
+    let mut targets = vec![
+        options.id.clone(),
+        // The advertised address, with and without its port: an operator types
+        // whichever form, and the client echoes it back.
+        local.ip().to_string(),
+        local.to_string(),
+        options.listen.ip().to_string(),
+        options.listen.to_string(),
+    ];
+    for spelling in [&options.id, &local.to_string(), &options.listen.to_string()] {
+        // Only a single colon is a host:port split; an IPv6 literal keeps its
+        // brackets.
+        if let Some((host, _)) = spelling.rsplit_once(':') {
+            if !host.contains(':') {
+                targets.push(host.to_owned());
+            }
+        }
+    }
+    // A wildcard bind address is never an identity a peer sends, in either its
+    // bare or its host:port spelling.
+    targets.retain(|target| {
+        if target.is_empty() {
+            return false;
+        }
+        let host = match target.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => target.as_str(),
+        };
+        host != "0.0.0.0" && host != "::" && host != "[::]"
+    });
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 async fn authenticate(
@@ -444,24 +560,45 @@ async fn authenticate(
         .map_err(|_| HostError::AuthenticationFailed)?
         + 1;
     state.clear_request();
-    let salt: String = sodiumoxide::randombytes::randombytes(16)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    // One line per accepted connection, with the epoch that appears in every
+    // later approval line. Without it a session that stalls before approval
+    // leaves no trace of having reached the host at all.
+    eprintln!("auth_begin epoch={epoch} origin={origin}");
+    // A client's first hash is built against the salt this session announces, so
+    // a stored permanent password only matches when that salt is the one it was
+    // hashed with. Without one, a fresh random salt is announced.
+    let stored_salt = Config::get_effective_permanent_password_salt();
+    let salt: String = if stored_salt.is_empty() {
+        sodiumoxide::randombytes::randombytes(16)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    } else {
+        stored_salt
+    };
     // Local input policy, resolved once per session. Both the ceiling and the
     // approval grant come from this one decision, so the peer can never hold an
     // input permission this machine did not explicitly arm. Audio, file and
     // clipboard stay denied unconditionally.
     let local_permissions = local_permissions(options);
+    // The one-time password is plaintext in memory, so this session's salt is the
+    // one a client's first hash is built against. Generate one when the operator
+    // has none, exactly as the original host does at startup.
+    if password_security::temporary_password().is_empty() {
+        password_security::update_temporary_password();
+    }
+    let passwords = host_passwords(
+        &salt,
+        &password_security::temporary_password(),
+        permanent_password_h1(),
+        password_security::permanent_enabled(),
+        password_security::temporary_enabled(),
+    );
     let config = HostAuthConfig {
-        accepted_targets: vec![
-            options.id.clone(),
-            local.ip().to_string(),
-            local.to_string(),
-        ],
+        accepted_targets: accepted_targets(options, local),
         salt,
-        passwords: Passwords::from_salted(Vec::new()),
-        policy: PrimaryPolicy::ClickOnly,
+        passwords: Passwords::from_salted(passwords),
+        policy: host_policy(password_security::approve_mode()),
         ceiling: local_permissions,
         password_permissions: Permissions::default(),
         peer_info: peer_info(options, codecs),
@@ -473,10 +610,18 @@ async fn authenticate(
         second_factor: Box::new(NoSecondFactor),
         attempts: Box::new(NoPasswordAttempts),
     };
-    let identity = HostIdentity::Signed {
-        id: options.id.clone(),
-        secret_key: options.signing_key.clone(),
-    };
+    // The original host presents its signed identity only when it actually holds
+    // an hbbs-issued signing key pair; a listener that is not registered with a
+    // rendezvous server has none, and a peer could not verify one signed by a key
+    // it has never seen. It sends nothing and lets the password challenge be the
+    // first record, exactly as `on_open` writes it.
+    //
+    // Sending an unverifiable identity instead is not harmless: a direct peer
+    // reads one record, ignores the identity it cannot check, and then waits for
+    // the challenge -- while this side waits for a record that the peer has no
+    // reason to send. The connection then idles until a timeout closes it, which
+    // the peer reports as a reset by the peer.
+    let identity = HostIdentity::LegacyPlain;
     let mut session = HostSession::accept_direct(socket, identity, config, Duration::from_secs(90))
         .await
         .map_err(|_| HostError::AuthenticationFailed)?;
@@ -487,7 +632,21 @@ async fn authenticate(
             _ = state.cancel.cancelled() => return Err(HostError::TransportFailed),
             value = session.recv_with_approval(&state.approval) => value,
         }
-        .map_err(|_| HostError::AuthenticationFailed)?;
+        .map_err(|error| {
+            // The phase alone cannot say whether a stalled session timed out,
+            // closed, or failed to parse; the reason is what names the step.
+            eprintln!("auth_recv_failed epoch={epoch} origin={origin} error={error}");
+            HostError::AuthenticationFailed
+        })?;
+        let event_name = match &event {
+            HostEvent::Progress => "progress",
+            HostEvent::AwaitApproval => "awaiting_approval",
+            HostEvent::LoginRejected(reason) => reason,
+            HostEvent::Authorized(_) => "authorized",
+            HostEvent::Unsupported => "unsupported",
+            HostEvent::Closed => "closed",
+        };
+        eprintln!("auth_event epoch={epoch} origin={origin} event={event_name}");
         match event {
             HostEvent::AwaitApproval => {
                 // Do not reset an already latched decision on a repeated remote
@@ -501,9 +660,12 @@ async fn authenticate(
             }
             HostEvent::Authorized(_) => {
                 state.clear_request();
-                return session
-                    .into_authenticated_parts()
-                    .map_err(|_| HostError::AuthenticationFailed);
+                let parts = session.into_authenticated_parts().map_err(|_| {
+                    eprintln!("auth_parts_failed epoch={epoch} origin={origin}");
+                    HostError::AuthenticationFailed
+                })?;
+                eprintln!("auth_authorized epoch={epoch} origin={origin}");
+                return Ok(parts);
             }
             HostEvent::Closed | HostEvent::LoginRejected(_) => {
                 return Err(HostError::ApprovalDenied);
@@ -511,6 +673,10 @@ async fn authenticate(
             _ => {}
         }
     }
+    // The bounded loop ran out: 64 records arrived and none of them completed
+    // authentication. Naming that is the difference between a stalled session
+    // and a peer that keeps sending.
+    eprintln!("auth_exhausted epoch={epoch} origin={origin} records=64");
     Err(HostError::AuthenticationFailed)
 }
 
@@ -623,6 +789,109 @@ async fn peer(
     rx_result.map_err(|_| HostError::TransportFailed)?
 }
 
+/// Whether the peer is currently subscribed to this host's display.
+fn subscribed(state: &State) -> bool {
+    state
+        .snapshot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .video_subscribed
+}
+
+/// Why a peer record was dropped instead of answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropped {
+    /// This host has no chat feature.
+    Chat,
+    /// A display operation this single-display host cannot perform.
+    Display,
+}
+
+/// What one peer record means for the session.
+///
+/// The classification mirrors the original host's dispositions: only a close
+/// request ends the connection. Input without a permission, display operations
+/// for another display and features this host does not have are dropped, because
+/// closing the session for them turns a controller's ordinary action into a
+/// reconnect and a fresh password prompt on the far side.
+#[derive(Debug, Clone)]
+enum Disposition {
+    /// Nothing to do; the session continues.
+    None,
+    /// A record that needs an answer on the wire.
+    Reply(Message),
+    /// Ask the encoder for a keyframe.
+    Keyframe,
+    /// Pointer, keyboard or text input.
+    Input,
+    /// The peer's subscription to this host's display changed.
+    Subscribed(bool),
+    /// Dropped, with the reason counted.
+    Dropped(Dropped),
+    /// The peer asked to end the session.
+    Close,
+}
+
+fn classify(message: &Message, width: i32, height: i32) -> Disposition {
+    match &message.union {
+        Some(message::Union::TestDelay(probe)) if probe.from_client => {
+            let mut reply = Message::new();
+            reply.set_test_delay(probe.clone());
+            Disposition::Reply(reply)
+        }
+        Some(message::Union::Misc(m)) => match &m.union {
+            Some(misc::Union::CloseReason(_)) => Disposition::Close,
+            Some(misc::Union::RefreshVideo(true))
+            | Some(misc::Union::RefreshVideoDisplay(0)) => Disposition::Keyframe,
+            Some(misc::Union::MessageQuery(q)) if q.switch_display == 0 => {
+                let mut misc = proto::Misc::new();
+                misc.set_switch_display(proto::SwitchDisplay {
+                    width,
+                    height,
+                    ..Default::default()
+                });
+                let mut reply = Message::new();
+                reply.set_misc(misc);
+                Disposition::Reply(reply)
+            }
+            Some(misc::Union::CaptureDisplays(displays)) => {
+                // Another display cannot be served by this single-display host,
+                // and a subscription change for this one only starts or stops the
+                // stream. Neither is a reason to close the connection.
+                if displays
+                    .add
+                    .iter()
+                    .chain(displays.set.iter())
+                    .any(|display| *display != 0)
+                {
+                    return Disposition::Dropped(Dropped::Display);
+                }
+                if displays.sub.contains(&0) {
+                    return Disposition::Subscribed(false);
+                }
+                if displays.add.contains(&0) || displays.set.contains(&0) {
+                    return Disposition::Subscribed(true);
+                }
+                Disposition::None
+            }
+            // This host never changes the local screen's resolution, and it says
+            // so by ignoring the request rather than by dropping the session.
+            Some(misc::Union::ChangeResolution(_))
+            | Some(misc::Union::ChangeDisplayResolution(_)) => {
+                Disposition::Dropped(Dropped::Display)
+            }
+            Some(misc::Union::ChatMessage(_)) => Disposition::Dropped(Dropped::Chat),
+            _ => Disposition::None,
+        },
+        Some(
+            message::Union::MouseEvent(_)
+            | message::Union::KeyEvent(_)
+            | message::Union::PointerDeviceEvent(_),
+        ) => Disposition::Input,
+        _ => Disposition::None,
+    }
+}
+
 async fn read_peer(
     state: Arc<State>,
     mut reader: WireReader,
@@ -639,71 +908,28 @@ async fn read_peer(
             _ = cancel.cancelled() => return Ok(()),
             value = reader.recv() => value.map_err(|_| HostError::TransportFailed)?.ok_or(HostError::TransportFailed)?,
         };
-        let output = match message.union {
-            Some(message::Union::TestDelay(probe)) if probe.from_client => {
-                let mut m = Message::new();
-                m.set_test_delay(probe);
-                Some(Control::Reply(m))
+        let output = match classify(&message, width, height) {
+            Disposition::Close => {
+                // The peer asked to end the session; that is the one record that
+                // closes it.
+                return Ok(());
             }
-            Some(message::Union::Misc(m)) => match m.union {
-                Some(misc::Union::CloseReason(_)) => return Ok(()),
-                Some(misc::Union::RefreshVideo(true))
-                | Some(misc::Union::RefreshVideoDisplay(0)) => Some(Control::Keyframe),
-                Some(misc::Union::MessageQuery(q)) if q.switch_display == 0 => {
-                    let mut misc = proto::Misc::new();
-                    misc.set_switch_display(proto::SwitchDisplay {
-                        width,
-                        height,
-                        ..Default::default()
-                    });
-                    let mut m = Message::new();
-                    m.set_misc(misc);
-                    Some(Control::Reply(m))
-                }
-                Some(misc::Union::CaptureDisplays(displays)) => {
-                    if displays
-                        .add
-                        .iter()
-                        .chain(displays.set.iter())
-                        .any(|v| *v != 0)
-                    {
-                        return Err(HostError::UnsupportedDisplay);
-                    }
-                    // A withdrawn subscription must stop capture, not keep sending
-                    // an unrequested display. Re-subscribing needs a fresh session
-                    // in this explicitly single-display first host slice.
-                    if displays.sub.contains(&0) {
-                        return Ok(());
-                    }
-                    None
-                }
-                // No silent resolution changes or unauthorized system operations.
-                Some(misc::Union::ChangeResolution(_))
-                | Some(misc::Union::ChangeDisplayResolution(_)) => {
-                    return Err(HostError::UnsupportedDisplay);
-                }
-                // Chat was removed from this controlled side. Counting the drop
-                // keeps the removal observable instead of silently swallowing a
-                // message the user believes was delivered.
-                Some(misc::Union::ChatMessage(_)) => {
-                    state.update(|s| s.dropped_chat_messages += 1);
-                    None
-                }
-                _ => None,
-            },
-            // Pointer, keyboard and text input are injected only when the local
-            // operator armed a platform sink AND authentication granted the
-            // keyboard permission. Anything else is dropped, never forwarded to
-            // a legacy runtime and never answered with a fake success.
-            Some(union @ (message::Union::MouseEvent(_) | message::Union::KeyEvent(_))) => {
-                let Some(sink) = input_sink.filter(|_| permissions.keyboard) else {
-                    return Ok(());
-                };
-                match decode_message(&union) {
+            Disposition::Reply(reply) => Some(Control::Reply(reply)),
+            Disposition::Keyframe => Some(Control::Keyframe),
+            Disposition::Subscribed(subscribed) => {
+                state.update(|s| s.video_subscribed = subscribed);
+                None
+            }
+            Disposition::Input => {
+                // Injection needs both the granted permission and a platform
+                // sink. Without them the record is dropped and the session stays
+                // up, exactly as the original host skips an injection it is not
+                // allowed to perform.
+                let sink = input_sink.filter(|_| permissions.keyboard);
+                match (sink, message.union.as_ref().and_then(decode_message)) {
                     // A malformed or unsupported action is dropped: guessing at a
                     // key or button the user never pressed is worse than nothing.
-                    None => None,
-                    Some(action) => {
+                    (Some(sink), Some(action)) => {
                         if sink(action) {
                             state.update(|s| s.injected_inputs += 1);
                         } else {
@@ -711,11 +937,20 @@ async fn read_peer(
                         }
                         None
                     }
+                    _ => {
+                        state.update(|s| s.dropped_inputs += 1);
+                        None
+                    }
                 }
             }
-            // File/audio/clipboard adapters are absent. No fake adapter is
-            // installed and no permission is advertised for them.
-            _ => None,
+            Disposition::Dropped(reason) => {
+                state.update(|s| match reason {
+                    Dropped::Chat => s.dropped_chat_messages += 1,
+                    Dropped::Display => s.ignored_display_requests += 1,
+                });
+                None
+            }
+            Disposition::None => None,
         };
         if let Some(output) = output {
             control
@@ -763,58 +998,134 @@ async fn publish(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    // Never abort a native creation/join just because its caller canceled.
-    let publisher = match Publisher::open(config).await {
-        Ok(value) => value,
-        Err(error) => {
-            if error.resources_unconfirmed() {
-                state.unreclaimed.store(true, Ordering::Release);
-                return Err(HostError::ReclamationUnconfirmed);
+    // A capture that fails or ends must not end the session: the peer reads a
+    // closed connection as a dropped session and reconnects with a fresh
+    // password prompt, while the failure belongs to the platform recorder and
+    // not to the peer. Reclamation stays strict, and a publisher whose native
+    // owner cannot be confirmed still quarantines the host.
+    let mut restarts: u32 = 0;
+    loop {
+        let publisher = match Publisher::open(config).await {
+            Ok(value) => value,
+            Err(error) => {
+                if error.resources_unconfirmed() {
+                    state.unreclaimed.store(true, Ordering::Release);
+                    return Err(HostError::ReclamationUnconfirmed);
+                }
+                state.update(|s| s.capture_restarts += 1);
+                if !backoff(&cancel, restarts).await {
+                    return Ok(());
+                }
+                restarts += 1;
+                continue;
             }
-            return Err(HostError::CaptureFailed);
+        };
+        let outcome = stream(&state, &mut writer, &mut control, &cancel, &publisher, codec).await;
+        publisher.request_close();
+        if publisher.close().await.is_err() {
+            state.unreclaimed.store(true, Ordering::Release);
+            return Err(HostError::ReclamationUnconfirmed);
         }
-    };
-    let result = async {
-        loop {
-            let (message, unit) = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Ok(()),
-                value = control.recv() => match value {
-                    Some(Control::Reply(message)) => (message, None),
-                    Some(Control::Keyframe) => {
-                        publisher.request_keyframe().map_err(|_| HostError::CaptureFailed)?;
-                        continue;
-                    }
-                    None => return Ok(()),
-                },
-                unit = publisher.recv(&cancel) => match unit.map_err(|_| HostError::CaptureFailed)? {
-                    Some(unit) => { let m = video(&unit, codec)?; (m, Some(unit)) },
-                    None => return Ok(()),
-                },
-            };
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Ok(()),
-                sent = writer.send(&message) => sent.map_err(|_| HostError::TransportFailed)?,
-            }
-            // The publisher's AU credit guard stays alive through the send. Only
-            // compressed Bytes are cloned into protobuf; no pixels are touched.
-            if let Some(unit) = unit {
-                state.update(|s| { s.phase = "streaming"; s.sent_units += 1; s.sent_bytes += unit.data.len() as u64; });
+        match outcome {
+            StreamEnd::Cancelled | StreamEnd::PeerGone => return Ok(()),
+            StreamEnd::Transport => return Err(HostError::TransportFailed),
+            StreamEnd::Capture => {
+                state.update(|s| s.capture_restarts += 1);
+                if !backoff(&cancel, restarts).await {
+                    return Ok(());
+                }
+                restarts += 1;
             }
         }
-    }.await;
-    publisher.request_close();
-    if publisher.close().await.is_err() {
-        state.unreclaimed.store(true, Ordering::Release);
-        return Err(HostError::ReclamationUnconfirmed);
     }
-    result
+}
+
+/// Why a capture stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// The session was cancelled locally.
+    Cancelled,
+    /// The peer-facing side of the session is gone.
+    PeerGone,
+    /// The socket to the peer failed.
+    Transport,
+    /// The platform recorder failed or stopped. Reopenable.
+    Capture,
+}
+
+/// Streams one capture session over the existing peer connection.
+///
+/// Returns why it ended; reopening is the caller's decision, which is what keeps
+/// a recorder restart inside the session instead of turning it into a reconnect.
+async fn stream(
+    state: &Arc<State>,
+    writer: &mut WireWriter,
+    control: &mut mpsc::Receiver<Control>,
+    cancel: &CancellationToken,
+    publisher: &Publisher,
+    codec: Codec,
+) -> StreamEnd {
+    loop {
+        let (message, unit) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return StreamEnd::Cancelled,
+            value = control.recv() => match value {
+                Some(Control::Reply(message)) => (message, None),
+                Some(Control::Keyframe) => {
+                    if publisher.request_keyframe().is_err() {
+                        return StreamEnd::Capture;
+                    }
+                    continue;
+                }
+                None => return StreamEnd::PeerGone,
+            },
+            // A peer that unsubscribed from this display keeps its session but
+            // receives no more frames until it subscribes again; the branch is
+            // disabled rather than the stream ended.
+            unit = publisher.recv(cancel), if subscribed(state) => match unit {
+                Ok(Some(unit)) => match video(&unit, codec) {
+                    Ok(message) => (message, Some(unit)),
+                    Err(_) => return StreamEnd::Capture,
+                },
+                Ok(None) => return StreamEnd::Capture,
+                Err(_) => return StreamEnd::Capture,
+            },
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return StreamEnd::Cancelled,
+            sent = writer.send(&message) => {
+                if sent.is_err() {
+                    return StreamEnd::Transport;
+                }
+            }
+        }
+        // The publisher's AU credit guard stays alive through the send. Only
+        // compressed Bytes are cloned into protobuf; no pixels are touched.
+        if let Some(unit) = unit {
+            state.update(|s| { s.phase = "streaming"; s.sent_units += 1; s.sent_bytes += unit.data.len() as u64; });
+        }
+    }
+}
+
+/// Waits before reopening capture, with a bounded delay. False when cancelled.
+async fn backoff(cancel: &CancellationToken, restarts: u32) -> bool {
+    let delay = Duration::from_millis(500 * u64::from(restarts.min(4) + 1));
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HostOptions, InputSink, LocalGrant, local_permissions};
+
+    use super::{
+        ApproveMode, Disposition, Dropped, HostOptions, InputSink, LocalGrant, Message,
+        PrimaryPolicy, accepted_targets, classify, host_passwords, host_policy, local_permissions,
+        salted_password,
+    };
     use crate::input::{InputAction, MouseAction};
     use std::net::SocketAddr;
 
@@ -844,6 +1155,169 @@ mod tests {
         sink as InputSink
     }
 
+    /// The one-time password is salted with the salt this session announces,
+    /// which is what a client's first hash is built against.
+    #[test]
+    fn the_one_time_password_is_salted_with_the_session_salt() {
+        let permanent = salted_password(b"permanent", "stored-salt");
+        assert_eq!(
+            host_passwords("session-salt", "123456", Some(permanent), true, true),
+            vec![permanent, salted_password(b"123456", "session-salt")],
+            "both configured passwords are accepted at once"
+        );
+        assert_eq!(
+            host_passwords("session-salt", "123456", None, true, true),
+            vec![salted_password(b"123456", "session-salt")]
+        );
+        // The method the operator picked decides which of the two counts.
+        assert!(host_passwords("session-salt", "123456", None, true, false).is_empty());
+        assert_eq!(
+            host_passwords("session-salt", "", Some(permanent), true, false),
+            vec![permanent]
+        );
+        assert!(host_passwords("session-salt", "", None, true, true).is_empty());
+    }
+
+    /// The approval policy follows the operator's setting, as the original host.
+    #[test]
+    fn the_approval_mode_maps_to_the_host_policy() {
+        assert_eq!(
+            host_policy(ApproveMode::Password),
+            PrimaryPolicy::PasswordOnly
+        );
+        assert_eq!(host_policy(ApproveMode::Click), PrimaryPolicy::ClickOnly);
+        assert_eq!(
+            host_policy(ApproveMode::Both),
+            PrimaryPolicy::PasswordOrClick
+        );
+    }
+
+    /// The controller's ordinary actions must not end the session.
+    ///
+    /// The original host skips an injection it is not allowed to perform and
+    /// keeps the connection; a close here is seen by the far side as a dropped
+    /// session, which turns into a reconnect and a fresh password prompt.
+    #[test]
+    fn benign_peer_records_never_close_the_session() {
+        let mut mouse = Message::new();
+        mouse.set_mouse_event(hbb_common::message_proto::MouseEvent {
+            x: 10,
+            y: 10,
+            ..Default::default()
+        });
+        let mut key = Message::new();
+        key.set_key_event(hbb_common::message_proto::KeyEvent {
+            down: true,
+            ..Default::default()
+        });
+        let mut resolution = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_change_resolution(hbb_common::message_proto::Resolution::default());
+        resolution.set_misc(misc);
+        let mut other_display = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_capture_displays(hbb_common::message_proto::CaptureDisplays {
+            add: vec![1],
+            ..Default::default()
+        });
+        other_display.set_misc(misc);
+        for message in [&mouse, &key, &resolution, &other_display] {
+            let disposition = classify(message, 1920, 1080);
+            assert!(
+                !matches!(disposition, Disposition::Close),
+                "a benign record must keep the session: {:?}",
+                message.union
+            );
+        }
+        assert!(matches!(
+            classify(&mouse, 1920, 1080),
+            Disposition::Input
+        ));
+        assert!(matches!(
+            classify(&resolution, 1920, 1080),
+            Disposition::Dropped(Dropped::Display)
+        ));
+    }
+
+    /// A display subscription change starts or stops the stream, not the session.
+    #[test]
+    fn a_subscription_change_only_moves_the_stream() {
+        let mut unsubscribe = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_capture_displays(hbb_common::message_proto::CaptureDisplays {
+            sub: vec![0],
+            ..Default::default()
+        });
+        unsubscribe.set_misc(misc);
+        assert!(matches!(
+            classify(&unsubscribe, 1920, 1080),
+            Disposition::Subscribed(false)
+        ));
+
+        let mut subscribe = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_capture_displays(hbb_common::message_proto::CaptureDisplays {
+            add: vec![0],
+            ..Default::default()
+        });
+        subscribe.set_misc(misc);
+        assert!(matches!(
+            classify(&subscribe, 1920, 1080),
+            Disposition::Subscribed(true)
+        ));
+    }
+
+    /// A close request, a removed feature and a keepalive keep their exact meaning.
+    #[test]
+    fn a_close_request_is_the_only_record_that_ends_the_session() {
+        let mut close = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_close_reason("".into());
+        close.set_misc(misc);
+        assert!(matches!(classify(&close, 1920, 1080), Disposition::Close));
+
+        let mut chat = Message::new();
+        let mut misc = hbb_common::message_proto::Misc::new();
+        misc.set_chat_message(hbb_common::message_proto::ChatMessage::default());
+        chat.set_misc(misc);
+        assert!(matches!(
+            classify(&chat, 1920, 1080),
+            Disposition::Dropped(Dropped::Chat)
+        ));
+
+        let mut probe = Message::new();
+        probe.set_test_delay(hbb_common::message_proto::TestDelay {
+            from_client: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            classify(&probe, 1920, 1080),
+            Disposition::Reply(_)
+        ));
+    }
+
+    /// A peer sends the address it was handed, not this socket's bind address.
+    #[test]
+    fn a_wildcard_listener_still_accepts_the_advertised_ip() {
+        let mut options = options(true, Some(counting_sink()));
+        options.listen = "0.0.0.0:21118".parse().unwrap();
+        options.id = "192.168.108.155:21118".into();
+        let local: std::net::SocketAddr = "10.53.176.3:21118".parse().unwrap();
+        let targets = accepted_targets(&options, local);
+        // The bare IP is the form a direct client sends; the id keeps its port.
+        assert!(
+            targets.iter().any(|t| t == "192.168.108.155"),
+            "bare advertised IP must be accepted, got {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t == "192.168.108.155:21118"),
+            "advertised id must be accepted, got {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t == "0.0.0.0" || t == "0.0.0.0:21118"),
+            "a bind address is not an identity, got {targets:?}"
+        );
+    }
     #[test]
     fn input_requires_both_local_consent_and_a_platform_sink() {
         // Neither an absent sink nor an unarmed option may grant input, and the

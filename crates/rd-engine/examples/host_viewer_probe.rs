@@ -69,6 +69,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut parts = session.into_authenticated_parts()?;
+    // `--input` exercises what a controller actually sends: a view-only host
+    // must drop the input and keep the session, so the frames below are the
+    // proof that the connection survived it.
+    if std::env::args().any(|argument| argument == "--input") {
+        let mut pointer = Message::new();
+        pointer.set_mouse_event(proto::MouseEvent {
+            x: 32,
+            y: 32,
+            ..Default::default()
+        });
+        parts.writer.send(&pointer).await?;
+        let mut key = Message::new();
+        key.set_key_event(proto::KeyEvent {
+            down: true,
+            ..Default::default()
+        });
+        parts.writer.send(&key).await?;
+        eprintln!("sent pointer and key events");
+    }
     let mut misc = Misc::new();
     misc.set_refresh_video(true);
     let mut refresh = Message::new();

@@ -338,6 +338,32 @@ pub struct ViewerSnapshot {
     pub received_units: u64,
     pub pushed_units: u64,
     pub render_submissions: u64,
+    /// Units that carried a timestamp and contributed to the totals below.
+    pub timed_units: u64,
+    /// Total decoder-to-render latency in microseconds across those units.
+    /// Divided by `timed_units` this is the average the decoder is responsible
+    /// for, which is the part of the path this process controls.
+    pub pipeline_micros_total: u64,
+    /// The worst single latency in microseconds. Averages hide the stalls a
+    /// viewer actually notices, so both are reported.
+    pub pipeline_micros_peak: u64,
+    /// Arrival-to-render-submission latency in microseconds for the frames
+    /// counted below. This is the path an operator waits through and it is
+    /// several times the decoder's own work; the `pipeline_micros_*` figures
+    /// above measure the submission call alone and are not this.
+    pub render_micros_total: u64,
+    /// The worst single arrival-to-render latency in microseconds.
+    pub render_micros_peak: u64,
+    /// Frames that carried a matching arrival stamp and are counted above.
+    pub render_timed_units: u64,
+    /// Time units spent waiting for a place in the admission queue, in
+    /// microseconds. This is not decode work: it is the backlog that grows when
+    /// the peer sends faster than this device decodes, and reporting it as
+    /// decode time is what made the figure read absurdly high.
+    pub queue_micros_total: u64,
+    pub queue_timed_units: u64,
+    /// Units waiting for the decoder right now.
+    pub queued_units: u64,
     pub keyboard_allowed: bool,
     /// Peer-side clipboard permission. Local policy is separate.
     pub clipboard_allowed: bool,
@@ -477,6 +503,26 @@ impl State {
                 out.render_submissions = out
                     .render_submissions
                     .saturating_add(stats.render_submissions);
+                out.timed_units = out.timed_units.saturating_add(stats.timed_units);
+                out.pipeline_micros_total = out
+                    .pipeline_micros_total
+                    .saturating_add(stats.pipeline_micros_total);
+                out.pipeline_micros_peak = out.pipeline_micros_peak.max(stats.pipeline_micros_peak);
+                out.render_micros_total = out
+                    .render_micros_total
+                    .saturating_add(stats.render_micros_total);
+                out.render_micros_peak = out.render_micros_peak.max(stats.render_micros_peak);
+                out.render_timed_units = out
+                    .render_timed_units
+                    .saturating_add(stats.render_timed_units);
+                out.queue_micros_total = out
+                    .queue_micros_total
+                    .saturating_add(stats.queue_micros_total);
+                out.queue_timed_units = out
+                    .queue_timed_units
+                    .saturating_add(stats.queue_timed_units);
+                // A gauge, so the deepest of the observes rather than a sum.
+                out.queued_units = out.queued_units.max(observer.queued_units() as u64);
                 if let Some(error) = stats.failure {
                     out.error = Some(ViewerError::Decoder(error).to_string());
                 }
@@ -1734,12 +1780,19 @@ async fn feed_loop(
             state.phase("opening_decoder");
             let lease = lease.clone();
             state.resources_unconfirmed.store(true, Ordering::Release);
+            // Read before the closure takes ownership: the decoder is built on a
+            // blocking thread, and the rate is a plain value.
+            let stream_frame_rate = state.requested_fps.load(Ordering::Acquire);
             let opened = tokio::task::spawn_blocking(move || {
                 SurfaceDecoder::open(
                     DecoderConfig {
                         codec: next.0,
                         width: next.1.width,
                         height: next.1.height,
+                        // The rate the peer was asked to encode at. The platform's
+                        // variable refresh rate uses it to drive the panel, so it
+                        // has to be the stream's real rate and not a default.
+                        frame_rate: stream_frame_rate,
                         // One AU may be inside PushInputBuffer while one waits
                         // for an input callback; do not build a stale decode tail.
                         max_queued_units: 2,
@@ -1794,6 +1847,11 @@ async fn feed_loop(
                 bytes: frame.data.to_vec(),
                 pts_us,
                 kind: AccessUnitKind::Frame { key: frame.key },
+                // Stamped by the decoder at admission, which is the point the
+                // pipeline measurement starts from.
+                accepted_at: None,
+                // Stamped by the decoder when the unit leaves its queue.
+                dequeued_at: None,
             };
             if let Err(rejected) = decoder.submit_cancellable(unit, &state.cancel).await {
                 if state.cancel.is_cancelled() {

@@ -251,29 +251,66 @@ pub async fn host(
         });
         send(&mut wire, &message).await?;
         let reply = recv(&mut wire).await?;
-        let security = match reply.union {
-            Some(message::Union::PublicKey(key)) if key.asymmetric_value.is_empty() => {
+        // Exactly one record is read, and the key transition is decided from it.
+        //
+        // The original host does the same, and it is what the wire expects: a
+        // direct client sends one compatibility record and then waits for the
+        // password challenge, so nothing else is coming. Re-sending the identity
+        // as a prompt for a second record therefore deadlocked the connection --
+        // the peer waited for the challenge, this side waited for a record, and
+        // the peer reported the eventual close as a reset.
+        enum Reply {
+            /// Empty `asymmetric_value`: the peer asks for its registration key.
+            Refresh,
+            /// A usable key exchange, already decoded.
+            Encrypted(secretbox::Key),
+            /// No key transition. `carried` says whether a record still has to
+            /// be handed to the authentication phase.
+            Plain { carried: bool },
+        }
+        let decision = match &reply.union {
+            Some(message::Union::PublicKey(key)) if key.asymmetric_value.is_empty() => Reply::Refresh,
+            Some(message::Union::PublicKey(key)) => Reply::Encrypted(
+                Encrypt::decode(&key.symmetric_value, &key.asymmetric_value, &secret)
+                    .map_err(|_| invalid("Invalid peer key exchange"))?,
+            ),
+            // An empty record is the compatibility kick; it carries nothing.
+            None => Reply::Plain { carried: false },
+            // A login request that raced the challenge, or any other pre-auth
+            // record: keep it, because the original host logs this and continues
+            // in the clear rather than dropping the connection, and dropping the
+            // record would lose the request.
+            _ => Reply::Plain { carried: true },
+        };
+        let (security, prefetched) = match decision {
+            Reply::Refresh => (
                 Security::LegacyPlain {
                     registration_key_refresh: true,
-                }
-            }
-            Some(message::Union::PublicKey(key)) => {
-                let key = Encrypt::decode(&key.symmetric_value, &key.asymmetric_value, &secret)
-                    .map_err(|_| invalid("Invalid peer key exchange"))?;
+                },
+                None,
+            ),
+            Reply::Encrypted(key) => {
                 wire.set_key(key);
                 // Peer encryption does not authenticate the controlling user.
-                Security::Encrypted { peer_id: None }
+                (Security::Encrypted { peer_id: None }, None)
             }
-            None => Security::LegacyPlain {
-                registration_key_refresh: false,
-            },
-            // Do not consume an early LoginRequest as successful authorization.
-            _ => return Err(invalid("Unexpected message during key transition")),
+            Reply::Plain { carried: false } => (
+                Security::LegacyPlain {
+                    registration_key_refresh: false,
+                },
+                None,
+            ),
+            Reply::Plain { carried: true } => (
+                Security::LegacyPlain {
+                    registration_key_refresh: false,
+                },
+                Some(reply),
+            ),
         };
         Ok(Established {
             wire,
             security,
-            prefetched: None,
+            prefetched,
         })
     })
     .await

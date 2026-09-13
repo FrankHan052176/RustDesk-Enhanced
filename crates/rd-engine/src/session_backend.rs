@@ -71,6 +71,21 @@ impl SessionBackend {
                     // frame is the equivalent event.
                     pushed_units: snapshot.taken_frames,
                     render_submissions: snapshot.taken_frames,
+                    // VNC has no decoder: the picture arrives as pixels and the
+                    // only latency is the raw frame reaching a frontend, which
+                    // this layer does not time.
+                    timed_units: 0,
+                    pipeline_micros_total: 0,
+                    pipeline_micros_peak: 0,
+                    // A raw framebuffer is blitted straight to the surface, so
+                    // there is no decode stage to time. Reporting a number here
+                    // would be a fabrication.
+                    render_micros_total: 0,
+                    render_micros_peak: 0,
+                    render_timed_units: 0,
+                    queue_micros_total: 0,
+                    queue_timed_units: 0,
+                    queued_units: 0,
                     keyboard_allowed: snapshot.keyboard_allowed,
                     clipboard_allowed: snapshot.clipboard_allowed,
                     // No quality negotiation exists, so the reported value is the

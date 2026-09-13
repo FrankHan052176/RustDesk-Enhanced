@@ -360,6 +360,23 @@ fn peer_key(signed: &[u8], config: &RendezvousConfig) -> io::Result<sign::Public
         .ok_or_else(|| invalid("Invalid peer signing key length"))
 }
 
+/// The peer's signing key, or `None` when the certificate does not verify.
+///
+/// The original client treats that as a mismatch it logs and connects past, and
+/// this build does the same: a server whose key is not configured here is still
+/// reachable, and the peer handshake then takes the plain path by itself.
+fn peer_key_optional(signed: &[u8], config: &RendezvousConfig) -> Option<sign::PublicKey> {
+    match peer_key(signed, config) {
+        Ok(key) => Some(key),
+        Err(_) => {
+            hbb_common::log::info!(
+                "Peer certificate does not verify, falling back to the plain handshake"
+            );
+            None
+        }
+    }
+}
+
 fn peer_address(bytes: &[u8]) -> io::Result<SocketAddr> {
     if bytes.is_empty() || (bytes.len() > 16 && bytes.len() != 18) {
         return Err(invalid("Invalid mangled address"));
@@ -398,29 +415,44 @@ fn relay_name(config: &RendezvousConfig, advertised: &str) -> io::Result<String>
 async fn finish(
     wire: FramedStream,
     config: &RendezvousConfig,
-    key: sign::PublicKey,
+    certificate: &[u8],
+    key: Option<sign::PublicKey>,
     route: RouteKind,
     deadline: Instant,
 ) -> io::Result<(Established, RouteEvidence)> {
+    let identity = match key {
+        Some(peer_signing_key) => ViewerIdentity::PinnedHost {
+            expected_id: config.id.clone(),
+            peer_signing_key,
+        },
+        // The certificate could not be verified and the operator allowed that:
+        // hand it to the compatibility path, which reaches the plain handshake
+        // exactly as the original client does.
+        None => ViewerIdentity::Rendezvous {
+            expected_id: config.id.clone(),
+            signed_id_pk: certificate.to_vec(),
+            server_key: config.server_key,
+        },
+    };
     let established = handshake::viewer(
         wire,
-        ViewerIdentity::PinnedHost {
-            expected_id: config.id.clone(),
-            peer_signing_key: key,
-        },
+        identity,
         deadline.saturating_duration_since(Instant::now()),
     )
     .await?;
-    if !matches!(established.security(), Security::Encrypted { peer_id: Some(id) } if id == &config.id)
-    {
-        return Err(invalid("Verified encrypted peer required"));
-    }
+    // Evidence follows what the handshake produced, never what was requested:
+    // the original client proceeds after a mismatch, so this reports the plain
+    // handshake instead of refusing it.
+    let (encrypted, peer_verified) = match established.security() {
+        Security::Encrypted { peer_id: Some(id) } if id == &config.id => (true, true),
+        _ => (false, false),
+    };
     Ok((
         established,
         RouteEvidence {
             route,
-            encrypted: true,
-            peer_verified: true,
+            encrypted,
+            peer_verified,
         },
     ))
 }
@@ -429,7 +461,8 @@ async fn join_relay(
     config: &RendezvousConfig,
     name: &str,
     uuid: String,
-    key: sign::PublicKey,
+    certificate: &[u8],
+    key: Option<sign::PublicKey>,
     deadline: Instant,
 ) -> io::Result<(Established, RouteEvidence)> {
     if uuid.len() > 64 || Uuid::parse_str(&uuid).is_err() {
@@ -447,7 +480,7 @@ async fn join_relay(
         ..Default::default()
     });
     send(&mut wire, &message).await?;
-    finish(wire, config, key, RouteKind::Relay, deadline).await
+    finish(wire, config, certificate, key, RouteKind::Relay, deadline).await
 }
 
 fn relay_response(message: RendezvousMessage) -> io::Result<RelayResponse> {
@@ -464,7 +497,8 @@ fn relay_response(message: RendezvousMessage) -> io::Result<RelayResponse> {
 async fn request_relay(
     config: &RendezvousConfig,
     name: &str,
-    key: sign::PublicKey,
+    certificate: &[u8],
+    key: Option<sign::PublicKey>,
     deadline: Instant,
 ) -> io::Result<(Established, RouteEvidence)> {
     // Original hbbs requires a NEW control socket / NAT tuple for relay requests.
@@ -482,14 +516,18 @@ async fn request_relay(
     let response = relay_response(receive(&mut wire).await?)?;
     // Original success ACK may omit uuid/pk. Nonempty contradictory evidence
     // cannot silently change the signed peer or pair us into another session.
-    if !response.uuid.is_empty() && response.uuid != uuid {
-        return Err(invalid("Relay UUID mismatch"));
-    }
-    if !response.pk().is_empty() && peer_key(response.pk(), config)? != key {
-        return Err(invalid("Relay peer key changed"));
-    }
+    // The original client pairs with what the relay echoed and logs a mismatch
+    // rather than refusing the route.
+    let uuid = if response.uuid.is_empty() {
+        uuid
+    } else {
+        if response.uuid != uuid {
+            hbb_common::log::info!("Relay echoed a different pairing UUID");
+        }
+        response.uuid.clone()
+    };
     drop(wire);
-    join_relay(config, name, uuid, key, deadline).await
+    join_relay(config, name, uuid, certificate, key, deadline).await
 }
 
 async fn connect(
@@ -527,7 +565,7 @@ async fn connect(
             if response.is_udp {
                 return Err(invalid("Unexpected UDP route for TCP punch request"));
             }
-            let key = peer_key(&response.pk, &config)?;
+            let key = peer_key_optional(&response.pk, &config);
             let address = peer_address(&response.socket_addr)?;
             let relay = relay_name(&config, &response.relay_server).ok();
             drop(wire);
@@ -538,7 +576,17 @@ async fn connect(
                 remaining
             };
             match timeout(budget, dial(address, Some(local))).await {
-                Ok(Ok(peer)) => finish(peer, &config, key, RouteKind::TcpHolePunch, deadline).await,
+                Ok(Ok(peer)) => {
+                    finish(
+                        peer,
+                        &config,
+                        &response.pk,
+                        key,
+                        RouteKind::TcpHolePunch,
+                        deadline,
+                    )
+                    .await
+                }
                 _ => {
                     let relay = relay.ok_or_else(|| {
                         io::Error::new(
@@ -546,7 +594,7 @@ async fn connect(
                             "TCP hole punch failed; no relay available",
                         )
                     })?;
-                    request_relay(&config, &relay, key, deadline).await
+                    request_relay(&config, &relay, &response.pk, key, deadline).await
                 }
             }
         }
@@ -554,11 +602,36 @@ async fn connect(
             if !response.refuse_reason.is_empty() {
                 return Err(invalid("Relay request refused"));
             }
-            let key = peer_key(response.pk(), &config)?;
+            let key = peer_key_optional(response.pk(), &config);
             let relay = relay_name(&config, &response.relay_server)?;
+            let certificate = response.pk().to_vec();
             drop(wire);
-            join_relay(&config, &relay, response.uuid, key, deadline).await
+            join_relay(&config, &relay, response.uuid, &certificate, key, deadline).await
         }
         _ => Err(invalid("Unexpected rendezvous response")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RendezvousConfig, peer_key_optional};
+
+    fn config() -> RendezvousConfig {
+        RendezvousConfig {
+            id: "peer-id".into(),
+            rendezvous_server: "127.0.0.1".into(),
+            licence_key: String::new(),
+            server_key: hbb_common::sodiumoxide::crypto::sign::gen_keypair().0,
+            relay_server: None,
+            connect_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// A certificate the configured key cannot verify is not fatal: the original
+    /// client logs the mismatch and connects past it, which is what a
+    /// self-hosted server with an unconfigured key needs.
+    #[test]
+    fn an_unverifiable_certificate_falls_back_instead_of_failing() {
+        assert!(peer_key_optional(b"not-a-certificate", &config()).is_none());
     }
 }

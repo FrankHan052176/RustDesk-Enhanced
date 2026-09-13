@@ -410,8 +410,17 @@ impl VncSession {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// Read `ServerInit` and send the client's pixel format and encodings.
+    /// Send `ClientInit`, then read `ServerInit` and set the client's preferences.
+    ///
+    /// The order is the protocol's: once the security handshake succeeds the
+    /// client speaks first with its one-byte shared flag, and only then does the
+    /// server send `ServerInit`. A client that waits first deadlocks against a
+    /// server that follows the order, which is what a live TightVNC server did.
     fn initialise(&mut self) -> Result<(), VncError> {
+        // Shared: existing clients are not to be disconnected for this one.
+        self.stream
+            .write_all(&[1])
+            .map_err(|error| VncError::io("client init", error))?;
         let mut header = [0u8; 24];
         self.stream
             .read_exact(&mut header)
@@ -779,6 +788,46 @@ mod tests {
         stream.flush().expect("flush");
     }
 
+    /// The client must speak before the server does at this point.
+    ///
+    /// RFC 6143: after a successful security handshake the client sends a
+    /// one-byte shared flag, and the server answers with `ServerInit`. Waiting
+    /// first deadlocks against any server that follows the order -- a live
+    /// TightVNC server did exactly that.
+    #[test]
+    fn the_client_sends_its_shared_flag_before_server_init_is_expected() {
+        let (address, server) = run_against_script(|mut stream| {
+            stream.write_all(b"RFB 003.008\n").expect("banner");
+            let mut answer = [0u8; 12];
+            if !read_or_eof(&mut stream, &mut answer) {
+                return;
+            }
+            assert_eq!(&answer, protocol::PROTOCOL_VERSION_3_8);
+            // Security: None only, so no password exchange is needed.
+            stream.write_all(&[1, 1]).expect("security: None");
+            let mut choice = [0u8; 1];
+            if !read_or_eof(&mut stream, &mut choice) {
+                return;
+            }
+            assert_eq!(choice[0], 1);
+            stream
+                .write_all(&SECURITY_RESULT_OK.to_be_bytes())
+                .expect("result");
+            let mut shared = [0u8; 1];
+            if !read_or_eof(&mut stream, &mut shared) {
+                return;
+            }
+            assert_eq!(shared[0], 1, "the client sends a shared-flag ClientInit");
+            write_server_init(&mut stream, 4, 3, "ordered");
+        });
+        let (host, port) = address.rsplit_once(':').expect("host:port");
+        let session =
+            VncSession::connect_none(host, port.parse().expect("port")).expect("handshake");
+        assert_eq!(session.info().name, "ordered");
+        assert_eq!(session.info().width, 4);
+        server.join().expect("join");
+    }
+
     #[test]
     fn a_vendor_version_is_downgraded_to_3_8_and_the_session_initialises() {
         let (address, server) = run_against_script(|mut stream| {
@@ -797,6 +846,12 @@ mod tests {
             stream
                 .write_all(&SECURITY_RESULT_OK.to_be_bytes())
                 .expect("result");
+            // The client speaks first here, with its shared flag.
+            let mut shared = [0u8; 1];
+            if !read_or_eof(&mut stream, &mut shared) {
+                return;
+            }
+            assert_eq!(shared[0], 1, "the client sends a shared-flag ClientInit");
             write_server_init(&mut stream, 1024, 768, "test");
             // Read the pixel format and encodings the client sends.
             let mut set_format = [0u8; 20];

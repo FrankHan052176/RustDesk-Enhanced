@@ -111,6 +111,98 @@ async fn next_viewer_event(viewer: &mut ViewerSession) -> ViewerEvent {
 }
 
 #[tokio::test]
+async fn a_direct_peer_that_says_nothing_first_is_challenged_first() {
+    // The original client's direct-IP path opens raw TCP and sends nothing until
+    // the host's password challenge arrives -- it never runs the key exchange on
+    // that path, so it has nothing to say first. A host that writes an identity
+    // record instead, or that waits for the peer to speak, leaves that client
+    // waiting until a timeout closes the connection, which the operator sees as
+    // a connection reset by the peer.
+    //
+    // This pins the wire order: the challenge is the first record, and the
+    // peer's login is the first record the host reads.
+    hbb_common::sodiumoxide::init().unwrap();
+    let password = randombytes::randombytes(24);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let host_config = config(&password);
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut host =
+            HostSession::accept_direct(stream, HostIdentity::LegacyPlain, host_config, TIMEOUT)
+                .await
+                .unwrap();
+        assert!(matches!(
+            next_host_event(&mut host).await,
+            HostEvent::LoginRejected("Empty Password")
+        ));
+    });
+    let mut wire = tcp_wire(address).await;
+    let first = recv(&mut wire).await;
+    assert!(
+        matches!(first.union, Some(message::Union::Hash(_))),
+        "the challenge must be the first record, got {:?}",
+        first.union
+    );
+    let mut request = Message::new();
+    request.set_login_request(login());
+    wire.send(&request).await.unwrap();
+    host.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_login_that_races_the_identity_record_still_reaches_authentication() {
+    // A peer that does not run the box key exchange -- an older client, or one
+    // that ignores the identity record -- answers that record with its login
+    // request instead of a public key. The handshake consumes it while choosing
+    // the security mode, so it has to be handed to the login phase: a dropped
+    // record leaves both sides waiting until a timeout closes the connection,
+    // which the operator sees as a reset by the peer.
+    hbb_common::sodiumoxide::init().unwrap();
+    let password = randombytes::randombytes(24);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let host_config = config(&password);
+    let (_, secret_key) = sign::gen_keypair();
+    let host = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut host = HostSession::accept_direct(
+            stream,
+            HostIdentity::Signed {
+                id: "test-target".into(),
+                secret_key,
+            },
+            host_config,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_host_event(&mut host).await,
+            HostEvent::LoginRejected("Empty Password")
+        ));
+    });
+    let mut wire = tcp_wire(address).await;
+    let identity = recv(&mut wire).await;
+    assert!(matches!(
+        identity.union,
+        Some(message::Union::SignedId(_))
+    ));
+    // This login is the only record the peer sends, and it is on the wire before
+    // the handshake finishes reading.
+    let mut request = Message::new();
+    request.set_login_request(login());
+    wire.send(&request).await.unwrap();
+    let challenge = recv(&mut wire).await;
+    assert!(
+        matches!(challenge.union, Some(message::Union::Hash(_))),
+        "the raced login must be answered with the challenge, got {:?}",
+        challenge.union
+    );
+    host.await.unwrap();
+}
+
+#[tokio::test]
 async fn direct_plain_wrong_then_right_password_and_close_over_tcp() {
     hbb_common::sodiumoxide::init().unwrap();
     let password = randombytes::randombytes(24);
@@ -443,6 +535,49 @@ async fn empty_public_key_requests_registration_refresh_without_fake_encryption(
     msg.set_public_key(PublicKey::new());
     wire.send(&msg).await.unwrap();
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kick_and_no_second_record_still_completes_the_key_transition() {
+    // A direct client sends one compatibility record -- an empty message -- and
+    // then waits for the password challenge. The host must decide the key
+    // transition from that single record: prompting for a second one deadlocks
+    // the connection, because that client has nothing left to send. The eventual
+    // close on timeout is what a peer reports as a reset by the peer.
+    //
+    // Nothing is sent after the kick here on purpose. If the host needed another
+    // record, this test would hang rather than pass.
+    hbb_common::sodiumoxide::init().unwrap();
+    let (_, sk) = sign::gen_keypair();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let local = stream.local_addr().unwrap();
+        handshake::host(
+            FramedStream::from(stream, local),
+            HostIdentity::Signed {
+                id: "host".into(),
+                secret_key: sk,
+            },
+            TIMEOUT,
+        )
+        .await
+        .unwrap()
+    });
+    let mut wire = tcp_wire(address).await;
+    assert!(matches!(
+        recv(&mut wire).await.union,
+        Some(message::Union::SignedId(_))
+    ));
+    wire.send(&Message::new()).await.unwrap();
+    let established = task.await.unwrap();
+    assert_eq!(
+        established.security(),
+        &Security::LegacyPlain {
+            registration_key_refresh: false
+        }
+    );
 }
 
 #[tokio::test]

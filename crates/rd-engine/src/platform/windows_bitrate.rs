@@ -49,6 +49,16 @@ const LOWER_AFTER_FRAMES: u32 = 240;
 const RAISE_STEP: f64 = 0.25;
 const LOWER_STEP: f64 = 0.12;
 
+/// Frames that must pass after a change before another one is considered.
+///
+/// A reconfiguration rebuilds the encoder's rate control, so the frames right
+/// after it are not evidence about the new rate. Without this the controller
+/// measured the previous rate's spend and moved again immediately: the host was
+/// observed stepping 24 frames apart between 44 and 108 Mbps, which is the
+/// picture flickering, not adaptation. This is one second at 60 fps and covers
+/// the encoder's settle at any rate the stream will run at.
+const SETTLE_AFTER_CHANGE_FRAMES: u32 = 60;
+
 /// What the controller needs to know about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamShape {
@@ -78,6 +88,8 @@ pub struct BitrateController {
     current: i64,
     short: Window,
     long: Window,
+    /// Frames observed since the last change, counted down.
+    settle: u32,
 }
 
 #[derive(Debug)]
@@ -126,6 +138,7 @@ impl BitrateController {
             current: initial.clamp(MIN_BITRATE, MAX_BITRATE),
             short: Window::new(),
             long: Window::new(),
+            settle: 0,
         }
     }
 
@@ -141,39 +154,54 @@ impl BitrateController {
         self.short.add(bytes);
         self.long.add(bytes);
 
+        // A change is still settling: keep observing so the windows hold real
+        // evidence, but make no decision from it.
+        if self.settle > 0 {
+            self.settle -= 1;
+            return Decision::Hold;
+        }
+
         let short_ratio = self.short.ratio(self.current, self.shape.fps);
         let long_ratio = self.long.ratio(self.current, self.shape.fps);
-        let fps = self.shape.fps;
 
         // Raising is checked first and needs only the short window: an
         // under-encoded picture is visible now and waiting would prolong it.
         if self.short.frames >= RAISE_AFTER_FRAMES && short_ratio >= HIGH_WATER {
             self.short.reset();
-            self.long.reset();
+            // The long window is deliberately NOT cleared. It is the only
+            // evidence that the budget is too large, and clearing it on every
+            // raise meant it never accumulated enough frames to fire: the rate
+            // climbed to the encoder's ceiling and was then cut back, which is
+            // the pulse this controller exists to prevent.
             let target = (self.current as f64 * (1.0 + RAISE_STEP)) as i64;
-            return self.apply(target);
+            return self.apply(target, true);
         }
         if self.long.frames >= LOWER_AFTER_FRAMES {
             if long_ratio <= LOW_WATER {
                 self.short.reset();
                 self.long.reset();
                 let target = (self.current as f64 * (1.0 - LOWER_STEP)) as i64;
-                return self.apply(target);
+                return self.apply(target, true);
             }
             // The long window is stale evidence about slack, so it restarts even
             // when nothing was decided; the short window keeps its own count.
             self.long.reset();
         }
-        let _ = fps;
         Decision::Hold
     }
 
-    fn apply(&mut self, target: i64) -> Decision {
+    fn apply(&mut self, target: i64, count_settle: bool) -> Decision {
         let clamped = target.clamp(MIN_BITRATE, MAX_BITRATE);
         if clamped == self.current {
             return Decision::Hold;
         }
         self.current = clamped;
+        if count_settle {
+            // The frame that carries the change is itself observed, so the
+            // window has to include it or the gap between changes is one frame
+            // short of what the constant says.
+            self.settle = SETTLE_AFTER_CHANGE_FRAMES + 1;
+        }
         Decision::Change(clamped)
     }
 }
@@ -225,21 +253,82 @@ mod tests {
     }
 
     #[test]
-    fn a_long_lull_lowers_the_rate_once() {
+    fn a_long_lull_lowers_the_rate_a_step_at_a_time() {
         let mut control = controller(20_000_000);
         let quiet = frame_bytes(20_000_000, 0.2, 60);
         let mut changes = 0;
         let mut last = 20_000_000;
-        for _ in 0..(LOWER_AFTER_FRAMES * 2) {
+        // Enough frames for two lowering windows including the settle time a
+        // change imposes before the next one may be considered.
+        let budget = LOWER_AFTER_FRAMES * 2 + SETTLE_AFTER_CHANGE_FRAMES * 2;
+        for _ in 0..budget {
             if let Decision::Change(rate) = control.observe(quiet) {
                 changes += 1;
                 assert!(rate < last, "lowering must go down, got {rate}");
                 last = rate;
             }
         }
-        // Two windows, so at most two steps; not a collapse to the floor.
-        assert_eq!(changes, 2, "expected one step per window");
+        // A step at a time, not a collapse to the floor.
+        assert!(changes >= 2, "expected at least one step per window, got {changes}");
+        assert!(changes <= 3, "lowering must not run away, got {changes}");
         assert!(control.current() > MIN_BITRATE);
+    }
+
+    #[test]
+    fn the_rate_does_not_step_faster_than_the_encoder_can_settle() {
+        // The host was observed stepping every 24 frames between 44 and
+        // 108 Mbps, which is the picture flickering rather than adapting. A
+        // change must be followed by the settle window before another is
+        // considered.
+        let mut control = controller(20_000_000);
+        let mut last_change_at = 0usize;
+        let mut frames = 0usize;
+        let mut first = true;
+        let mut changes = 0;
+        for _ in 0..(RAISE_AFTER_FRAMES * 40) {
+            frames += 1;
+            // Spend against the rate in force, not the opening one: a fixed byte
+            // count stops looking expensive once the controller has raised, so
+            // the scenario would produce a single change and prove nothing.
+            let busy = frame_bytes(control.current(), 0.95, 60);
+            if let Decision::Change(_) = control.observe(busy) {
+                changes += 1;
+                if !first {
+                    let gap = frames - last_change_at;
+                    assert!(
+                        gap >= SETTLE_AFTER_CHANGE_FRAMES as usize,
+                        "changes were {gap} frames apart, must be at least {SETTLE_AFTER_CHANGE_FRAMES}"
+                    );
+                }
+                first = false;
+                last_change_at = frames;
+            }
+        }
+        assert!(changes > 1, "the scenario must actually produce repeated changes");
+    }
+
+    #[test]
+    fn raising_does_not_discard_the_evidence_that_the_budget_is_too_large() {
+        // Clearing the long window on every raise left it permanently short of
+        // frames, so a rate that had climbed past what the content needs could
+        // never be brought back down.
+        let mut control = controller(20_000_000);
+        let busy = frame_bytes(20_000_000, 0.95, 60);
+        for _ in 0..(RAISE_AFTER_FRAMES * 4) {
+            control.observe(busy);
+        }
+        let raised = control.current();
+        assert!(raised > 20_000_000, "the rate should have climbed");
+        let quiet = frame_bytes(raised, 0.2, 60);
+        let mut lowered = false;
+        for _ in 0..(LOWER_AFTER_FRAMES + SETTLE_AFTER_CHANGE_FRAMES * 2) {
+            if let Decision::Change(rate) = control.observe(quiet) {
+                assert!(rate < raised, "the quiet stretch must bring the rate down");
+                lowered = true;
+                break;
+            }
+        }
+        assert!(lowered, "a long quiet stretch after a raise must lower the rate");
     }
 
     #[test]
@@ -290,12 +379,19 @@ mod tests {
             control.observe(busy);
         }
         let after_raise = control.current();
+        assert!(after_raise > 20_000_000, "a busy scene must raise the rate");
+
+        // A stretch of quiet as long as the one that caused the raise must not
+        // undo it. This is the property that stops the pulse: the encoder is
+        // given time to settle at the new rate before that rate is judged.
         let quiet = frame_bytes(after_raise, 0.2, 60);
-        for _ in 0..(LOWER_AFTER_FRAMES - 1) {
-            control.observe(quiet);
+        for _ in 0..(SETTLE_AFTER_CHANGE_FRAMES + RAISE_AFTER_FRAMES) {
+            assert_eq!(
+                control.observe(quiet),
+                Decision::Hold,
+                "a quiet stretch that short must not undo a raise"
+            );
         }
-        // After a raise, the same number of frames that caused it has not yet
-        // been enough to undo it.
         assert_eq!(control.current(), after_raise);
     }
 

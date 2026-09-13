@@ -6,7 +6,10 @@
 //! deliberately hands the decoder no usable surface so the failure is explicit
 //! instead of a silently black texture.
 
-use crate::{rendezvous::RendezvousConfig, viewer::SurfaceLease};
+use crate::{
+    rendezvous::RendezvousConfig,
+    viewer::SurfaceLease,
+};
 use hbb_common::{
     base64::{Engine as _, engine::general_purpose::STANDARD},
     config::{Config, RS_PUB_KEY, keys::OPTION_KEY},

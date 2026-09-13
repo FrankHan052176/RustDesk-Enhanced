@@ -174,6 +174,109 @@ async fn direct_punch_reuses_source_port_and_preserves_encrypted_auth_handoff() 
     assert_eq!(server.await.unwrap(), peer.await.unwrap());
 }
 
+/// A server whose key is not configured here cannot have its peer certificates
+/// verified. The original client connects anyway and this build does the same:
+/// the rendezvous stage is used as-is, the peer session falls back to the plain
+/// handshake, and the route evidence says exactly that.
+#[tokio::test]
+async fn an_unconfigured_server_key_falls_back_to_the_plain_handshake() {
+    sodiumoxide::init().unwrap();
+    let (server_pk, _) = sign::gen_keypair();
+    // The certificate is signed by a key this client does not trust, which is
+    // what a self-hosted server with an unconfigured key looks like.
+    let (_, other_sk) = sign::gen_keypair();
+    let (peer_pk, _) = sign::gen_keypair();
+    let hbbs = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_address = hbbs.local_addr().unwrap();
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_address = peer.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = hbbs.accept().await.unwrap();
+        let mut wire = wire(stream);
+        let Some(rendezvous_message::Union::PunchHoleRequest(_)) = control(&mut wire).await.union
+        else {
+            panic!("Expected PunchHoleRequest")
+        };
+        let mut response = RendezvousMessage::new();
+        response.set_punch_hole_response(PunchHoleResponse {
+            socket_addr: AddrMangle::encode(peer_address).into(),
+            pk: certificate(&peer_pk.0, &other_sk).into(),
+            ..Default::default()
+        });
+        wire.send(&response).await.unwrap();
+    });
+    let peer = tokio::spawn(async move {
+        let (stream, _) = peer.accept().await.unwrap();
+        let mut wire = wire(stream);
+        // The compatibility record the original client sends in this case: an
+        // empty message, after which the session is plain.
+        assert!(peer_message(&mut wire).await.union.is_none());
+        let mut response = Message::new();
+        response.set_hash(Hash {
+            salt: "salt".into(),
+            challenge: "challenge".into(),
+            ..Default::default()
+        });
+        wire.send(&response).await.unwrap();
+        let Some(message::Union::LoginRequest(request)) = peer_message(&mut wire).await.union else {
+            panic!("Expected plain LoginRequest")
+        };
+        assert_eq!(request.username, "target");
+        let mut success = LoginResponse::new();
+        success.set_peer_info(PeerInfo::new());
+        response.set_login_response(success);
+        wire.send(&response).await.unwrap();
+        response.set_test_delay(Default::default());
+        wire.send(&response).await.unwrap();
+        assert!(peer_message(&mut wire).await.misc().has_close_reason());
+    });
+    let (established, route) = connect_viewer(RendezvousConfig {
+        id: "target".into(),
+        rendezvous_server: format!("localhost:{}", server_address.port()),
+        licence_key: "wire-key".into(),
+        server_key: server_pk,
+        relay_server: None,
+        connect_timeout: LIMIT,
+    })
+    .await
+    .unwrap();
+    assert_eq!(route.route, RouteKind::TcpHolePunch);
+    // Unverified means exactly that: no encryption claim and no verified peer.
+    assert!(!route.encrypted && !route.peer_verified);
+    let mut session = ViewerSession::from_established(established, LIMIT, LIMIT);
+    assert!(matches!(
+        session.recv().await.unwrap(),
+        ViewerEvent::Challenge
+    ));
+    session
+        .login(
+            LoginRequest {
+                username: "target".into(),
+                my_id: "controller".into(),
+                ..Default::default()
+            },
+            Some(b"secret".as_slice()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.recv().await.unwrap(),
+        ViewerEvent::Authorized(_)
+    ));
+    let mut parts = session.into_authenticated_parts().unwrap();
+    assert!(matches!(
+        parts.reader.recv().await.unwrap().unwrap().union,
+        Some(message::Union::TestDelay(_))
+    ));
+    let mut misc = Misc::new();
+    misc.set_close_reason(String::new());
+    let mut close = Message::new();
+    close.set_misc(misc);
+    parts.writer.send(&close).await.unwrap();
+    server.await.unwrap();
+    peer.await.unwrap();
+}
+
 #[tokio::test]
 async fn relay_fallback_pairs_original_uuid_but_rejects_substituted_peer_key() {
     sodiumoxide::init().unwrap();
@@ -260,7 +363,7 @@ async fn relay_fallback_pairs_original_uuid_but_rejects_substituted_peer_key() {
             licence_key: "wire-key".into(),
             server_key: server_pk,
             relay_server: None,
-            connect_timeout: LIMIT,
+                connect_timeout: LIMIT,
         })
         .await
         .is_err()

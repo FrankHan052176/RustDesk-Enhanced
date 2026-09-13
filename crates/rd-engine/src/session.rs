@@ -578,6 +578,118 @@ pub enum HostEvent {
     Closed,
 }
 
+/// Whether a record carries an action a session must be authorized for.
+///
+/// Only these are terminal when they arrive before authorization. Control
+/// records -- options, display queries, refresh requests -- are answerable
+/// without one, and the original host ignores them in the same state, so
+/// treating them as a protocol violation breaks clients that speak in order.
+fn carries_client_action(message: &Message) -> bool {
+    matches!(
+        &message.union,
+        Some(message::Union::MouseEvent(_))
+            | Some(message::Union::PointerDeviceEvent(_))
+            | Some(message::Union::KeyEvent(_))
+            | Some(message::Union::Clipboard(_))
+            | Some(message::Union::MultiClipboards(_))
+            | Some(message::Union::FileAction(_))
+            | Some(message::Union::FileResponse(_))
+            | Some(message::Union::Cliprdr(_))
+            | Some(message::Union::TerminalAction(_))
+            | Some(message::Union::TerminalResponse(_))
+            | Some(message::Union::ScreenshotRequest(_))
+            | Some(message::Union::VoiceCallRequest(_))
+            | Some(message::Union::VoiceCallResponse(_))
+    )
+}
+
+/// A stable name for the union a record carries.
+///
+/// A trace that printed the whole message would leak payloads; the variant name
+/// is what a stalled handshake needs in order to be diagnosed.
+fn message_union_name(message: &Message) -> &'static str {
+    match &message.union {
+        None => "empty",
+        Some(message::Union::SignedId(_)) => "signed_id",
+        Some(message::Union::PublicKey(_)) => "public_key",
+        Some(message::Union::TestDelay(_)) => "test_delay",
+        Some(message::Union::VideoFrame(_)) => "video_frame",
+        Some(message::Union::LoginRequest(_)) => "login_request",
+        Some(message::Union::LoginResponse(_)) => "login_response",
+        Some(message::Union::Hash(_)) => "hash",
+        Some(message::Union::MouseEvent(_)) => "mouse_event",
+        Some(message::Union::AudioFrame(_)) => "audio_frame",
+        Some(message::Union::CursorData(_)) => "cursor_data",
+        Some(message::Union::CursorPosition(_)) => "cursor_position",
+        Some(message::Union::CursorId(_)) => "cursor_id",
+        Some(message::Union::KeyEvent(_)) => "key_event",
+        Some(message::Union::Clipboard(_)) => "clipboard",
+        Some(message::Union::FileAction(_)) => "file_action",
+        Some(message::Union::FileResponse(_)) => "file_response",
+        Some(message::Union::Misc(misc)) => misc_union_name(misc),
+        Some(message::Union::Auth2fa(_)) => "auth_2fa",
+        Some(message::Union::MultiClipboards(_)) => "multi_clipboards",
+        Some(message::Union::Cliprdr(_)) => "cliprdr",
+        Some(message::Union::MessageBox(_)) => "message_box",
+        Some(message::Union::SwitchSidesResponse(_)) => "switch_sides_response",
+        Some(message::Union::VoiceCallRequest(_)) => "voice_call_request",
+        Some(message::Union::VoiceCallResponse(_)) => "voice_call_response",
+        Some(message::Union::PeerInfo(_)) => "peer_info",
+        Some(message::Union::PointerDeviceEvent(_)) => "pointer_device_event",
+        Some(message::Union::ScreenshotRequest(_)) => "screenshot_request",
+        Some(message::Union::TerminalAction(_)) => "terminal_action",
+        Some(message::Union::TerminalResponse(_)) => "terminal_response",
+        _ => "other",
+    }
+}
+
+/// A stable name for the sub-message a `Misc` record carries.
+///
+/// `misc` alone cannot name what a peer sent, and the pre-auth records a client
+/// sends are exactly the ones worth naming.
+fn misc_union_name(misc: &hbb_common::message_proto::Misc) -> &'static str {
+    use hbb_common::message_proto::misc::Union;
+    match &misc.union {
+        None => "misc",
+        Some(Union::ChatMessage(_)) => "misc(chat)",
+        Some(Union::SwitchDisplay(_)) => "misc(switch_display)",
+        Some(Union::PermissionInfo(_)) => "misc(permission_info)",
+        Some(Union::Option(_)) => "misc(option)",
+        Some(Union::AudioFormat(_)) => "misc(audio_format)",
+        Some(Union::CloseReason(_)) => "misc(close_reason)",
+        Some(Union::RefreshVideo(_)) => "misc(refresh_video)",
+        Some(Union::VideoReceived(_)) => "misc(video_received)",
+        Some(Union::BackNotification(_)) => "misc(back_notification)",
+        Some(Union::RestartRemoteDevice(_)) => "misc(restart_remote_device)",
+        Some(Union::Uac(_)) => "misc(uac)",
+        Some(Union::ForegroundWindowElevated(_)) => "misc(foreground_window_elevated)",
+        Some(Union::StopService(_)) => "misc(stop_service)",
+        Some(Union::ElevationRequest(_)) => "misc(elevation_request)",
+        Some(Union::ElevationResponse(_)) => "misc(elevation_response)",
+        Some(Union::PortableServiceRunning(_)) => "misc(portable_service_running)",
+        Some(Union::SwitchSidesRequest(_)) => "misc(switch_sides_request)",
+        Some(Union::SwitchBack(_)) => "misc(switch_back)",
+        Some(Union::ChangeResolution(_)) => "misc(change_resolution)",
+        Some(Union::PluginRequest(_)) => "misc(plugin_request)",
+        Some(Union::PluginFailure(_)) => "misc(plugin_failure)",
+        Some(Union::FullSpeedFps(_)) => "misc(full_speed_fps)",
+        Some(Union::AutoAdjustFps(_)) => "misc(auto_adjust_fps)",
+        Some(Union::ClientRecordStatus(_)) => "misc(client_record_status)",
+        Some(Union::CaptureDisplays(_)) => "misc(capture_displays)",
+        Some(Union::RefreshVideoDisplay(_)) => "misc(refresh_video_display)",
+        Some(Union::ToggleVirtualDisplay(_)) => "misc(toggle_virtual_display)",
+        Some(Union::TogglePrivacyMode(_)) => "misc(toggle_privacy_mode)",
+        Some(Union::SupportedEncoding(_)) => "misc(supported_encoding)",
+        Some(Union::SelectedSid(_)) => "misc(selected_sid)",
+        Some(Union::ChangeDisplayResolution(_)) => "misc(change_display_resolution)",
+        Some(Union::MessageQuery(_)) => "misc(message_query)",
+        Some(Union::FollowCurrentDisplay(_)) => "misc(follow_current_display)",
+        // A variant this build does not know is still worth naming as unknown
+        // rather than as `misc`, which would hide that it arrived at all.
+        Some(_) => "misc(other)",
+    }
+}
+
 pub struct HostSession {
     io: SessionIo,
     auth: HostAuthentication,
@@ -820,6 +932,13 @@ impl HostSession {
             self.auth.close();
             return Ok(HostEvent::Closed);
         }
+        // Named records, not raw bytes: which union arrived is what says whether
+        // a peer ever sent its login request, and a phase alone cannot show it.
+        eprintln!(
+            "host_recv state={:?} union={}",
+            self.auth.state(),
+            message_union_name(&message)
+        );
         match message.union {
             None => Ok(HostEvent::Progress),
             Some(message::Union::TestDelay(probe)) => {
@@ -838,11 +957,22 @@ impl HostSession {
                 let action = self.auth.second_factor(code);
                 self.apply(action).await
             }
-            _ if self.auth.state() != HostAuthState::Authorized => {
+            // A record that carries an action is out of order before
+            // authorization and stays terminal: input, file and terminal
+            // payloads are only ever armed by an authenticated session.
+            _ if self.auth.state() != HostAuthState::Authorized && carries_client_action(&message) => {
                 self.io.send(&login_error("Connection not allowed")).await?;
                 self.auth.close();
                 Err(failure("Application payload before authentication"))
             }
+            // Everything else is a control record, and those are ignored rather
+            // than judged -- the original host ignores them the same way. A client
+            // legitimately pushes an option or asks for the display list before
+            // its login request; the original client's first record on a direct
+            // connection is one of those, and closing here ended the session for
+            // a peer that had done nothing wrong. Nothing is executed and nothing
+            // is deferred: the record is dropped.
+            _ if self.auth.state() != HostAuthState::Authorized => Ok(HostEvent::Progress),
             // No input/media/file/clipboard adapter exists yet. Do not report
             // success or call a legacy runtime simply because auth succeeded.
             _ => Ok(HostEvent::Unsupported),

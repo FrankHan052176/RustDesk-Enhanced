@@ -38,6 +38,12 @@ pub struct DecoderConfig {
     /// Maximum expected coded geometry for this decoder instance.
     pub width: i32,
     pub height: i32,
+    /// Capture rate the stream is encoded at.
+    ///
+    /// The platform's video variable refresh rate feature reads this to decide
+    /// what the panel should run at, so a decoder that does not know its own
+    /// frame rate cannot use the feature at all.
+    pub frame_rate: u32,
     pub max_queued_units: usize,
     pub max_queued_bytes: usize,
 }
@@ -56,6 +62,18 @@ pub struct AccessUnit {
     pub bytes: Vec<u8>,
     pub pts_us: i64,
     pub kind: AccessUnitKind,
+    /// When the unit was handed to the decoder, used to time the path from
+    /// arrival to the render submission. `None` means it was never submitted
+    /// through [`Shared::submit`], which is how a unit built by a test is
+    /// distinguished from one that travelled the real path.
+    pub accepted_at: Option<std::time::Instant>,
+    /// When the unit left the admission queue.
+    ///
+    /// The span from `accepted_at` to here is queue wait, and it is the part of
+    /// the path that grows without bound when the peer sends faster than this
+    /// device decodes. The span from here to the frame's submission is the work:
+    /// the decode itself plus the wait for an output buffer.
+    pub dequeued_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +113,31 @@ pub struct DecoderStats {
     pub pushed_units: u64,
     /// Successful RenderOutputBuffer submissions, NOT physical presentation.
     pub render_submissions: u64,
+    /// Total time from a unit's arrival to its render submission, in
+    /// microseconds. Divided by `timed_units` this is the average pipeline
+    /// latency the decoder is responsible for.
+    pub pipeline_micros_total: u64,
+    /// The worst single pipeline latency seen, in microseconds. An average hides
+    /// the stalls that a viewer notices as a stutter, so the peak is reported
+    /// alongside it.
+    pub pipeline_micros_peak: u64,
+    /// Units that carried a timestamp and contributed to the totals above.
+    pub timed_units: u64,
+    /// Arrival-to-render-submission latency, in microseconds. This is the path
+    /// the operator waits through: a unit's arrival, its decode, and the
+    /// submission of the frame it produced. `pipeline_micros_*` above measures
+    /// the submission call alone and is not this figure.
+    pub render_micros_total: u64,
+    /// The worst single arrival-to-render latency of the window, in
+    /// microseconds. An average hides the stalls a viewer notices as a stutter.
+    pub render_micros_peak: u64,
+    /// Frames that carried a matching arrival stamp and are counted above.
+    pub render_timed_units: u64,
+    /// Time units spent waiting for a place in the admission queue, in
+    /// microseconds. This is not decode work and must not be reported as it.
+    pub queue_micros_total: u64,
+    /// Units that were timed in the queue and are counted above.
+    pub queue_timed_units: u64,
     pub non_frame_outputs: u64,
     pub format_change_notifications: u64,
     pub cancelled_units: u64,
@@ -151,6 +194,16 @@ impl DecoderObserver {
         #[cfg(not(target_env = "ohos"))]
         {
             Err(DecoderError::UnsupportedPlatform)
+        }
+    }
+    pub fn queued_units(&self) -> usize {
+        #[cfg(target_env = "ohos")]
+        {
+            self.shared.queued_units()
+        }
+        #[cfg(not(target_env = "ohos"))]
+        {
+            0
         }
     }
     pub fn request_close(&self) {
@@ -332,6 +385,10 @@ mod engine {
         inputs: VecDeque<Buffer>,
         input_indices: HashSet<u32>,
         output_indices: HashSet<u32>,
+        /// Arrival instants of submitted units, awaiting the frame they produce.
+        /// Bounded by the submission reservation, so it cannot grow without a
+        /// matching output.
+        pending_latency: VecDeque<std::time::Instant>,
         // Includes the access unit removed by the worker until Push returns.
         reserved_units: usize,
         reserved_bytes: usize,
@@ -364,6 +421,7 @@ mod engine {
                     inputs: VecDeque::with_capacity(MAX_CALLBACKS),
                     input_indices: HashSet::with_capacity(MAX_CALLBACKS),
                     output_indices: HashSet::with_capacity(MAX_CALLBACKS),
+                    pending_latency: VecDeque::with_capacity(limits.max_queued_units),
                     reserved_units: 0,
                     reserved_bytes: 0,
                     eos_accepted: false,
@@ -376,7 +434,9 @@ mod engine {
             })
         }
 
-        pub fn submit(&self, unit: AccessUnit) -> Result<(), RejectedSubmission> {
+        pub fn submit(&self, mut unit: AccessUnit) -> Result<(), RejectedSubmission> {
+            unit.accepted_at = Some(std::time::Instant::now());
+            unit.dequeued_at = None;
             let mut state = lock(&self.state);
             let invalid = match unit.kind {
                 AccessUnitKind::EndOfStream => !unit.bytes.is_empty(),
@@ -468,10 +528,16 @@ mod engine {
                     return Action::Event(event);
                 }
                 if !state.inputs.is_empty() && !state.packets.is_empty() {
-                    return Action::Submit(
-                        state.inputs.pop_front().unwrap(),
-                        state.packets.pop_front().unwrap(),
-                    );
+                    let buffer = state.inputs.pop_front().unwrap();
+                    let mut unit = state.packets.pop_front().unwrap();
+                    // The unit leaves the queue exactly here, so everything it
+                    // waited for since arrival is behind it and what remains is
+                    // the decode plus the wait for an output buffer. Splitting
+                    // the two is the difference between a decode time and a queue
+                    // time; reporting their sum as either one is what made the
+                    // figure look absurd.
+                    unit.dequeued_at = Some(std::time::Instant::now());
+                    return Action::Submit(buffer, unit);
                 }
                 state = self.wake.wait(state).unwrap_or_else(|e| e.into_inner());
             }
@@ -489,7 +555,35 @@ mod engine {
             lock(&self.state).output_indices.remove(&index);
         }
         pub fn submitted(&self, bytes: usize, success: bool) {
+            self.submitted_at(bytes, success, None, None)
+        }
+
+        /// Record a completed submission, attributing the pipeline latency of the
+        /// unit that produced it.
+        ///
+        /// `elapsed_micros` is measured by the caller, which is the only place
+        /// that still has the unit: the callback path deliberately carries
+        /// indices rather than payloads, so the moment has to be taken there and
+        /// passed in.
+        pub fn submitted_at(
+            &self,
+            bytes: usize,
+            success: bool,
+            elapsed_micros: Option<u64>,
+            queue_micros: Option<u64>,
+        ) {
             let mut s = lock(&self.state);
+            if success {
+                // Queue the dequeue stamp for the frame this submission will
+                // produce. Stamping at dequeue rather than at arrival is what
+                // keeps the admission wait out of the render figure; this queue
+                // is what pairs a rendered frame with the unit behind it.
+                s.pending_latency.push_back(std::time::Instant::now());
+                if let Some(micros) = queue_micros {
+                    s.stats.queue_timed_units = s.stats.queue_timed_units.saturating_add(1);
+                    s.stats.queue_micros_total = s.stats.queue_micros_total.saturating_add(micros);
+                }
+            }
             s.reserved_units -= 1;
             s.reserved_bytes -= bytes;
             if success {
@@ -497,12 +591,31 @@ mod engine {
             } else {
                 s.stats.cancelled_units += 1;
             }
+            if let Some(micros) = elapsed_micros {
+                s.stats.timed_units += 1;
+                s.stats.pipeline_micros_total = s.stats.pipeline_micros_total.saturating_add(micros);
+                if micros > s.stats.pipeline_micros_peak {
+                    s.stats.pipeline_micros_peak = micros;
+                }
+            }
             self.capacity.notify_waiters();
         }
         pub fn output(&self, frame: bool, eos: bool) {
             let mut s = lock(&self.state);
             if frame {
                 s.stats.render_submissions += 1;
+                // The buffer carries no timestamp, so a frame is matched to the
+                // unit that arrived for it by submission order: the codec hands
+                // frames back in the order they were pushed. An empty queue is an
+                // output without a matching submission and is not a sample.
+                if let Some(arrived) = s.pending_latency.pop_front() {
+                    let micros = arrived.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    s.stats.render_timed_units = s.stats.render_timed_units.saturating_add(1);
+                    s.stats.render_micros_total = s.stats.render_micros_total.saturating_add(micros);
+                    if micros > s.stats.render_micros_peak {
+                        s.stats.render_micros_peak = micros;
+                    }
+                }
             } else {
                 s.stats.non_frame_outputs += 1;
             }
@@ -536,6 +649,13 @@ mod engine {
             state.output_indices.clear();
             self.wake.notify_one();
             self.capacity.notify_waiters();
+        }
+        /// Units waiting for a place in the decoder, right now.
+        ///
+        /// A gauge rather than a counter: it rises and falls, so it must not be
+        /// accumulated like the totals beside it.
+        pub fn queued_units(&self) -> usize {
+            lock(&self.state).packets.len()
         }
         pub fn stats(&self) -> DecoderStats {
             lock(&self.state).stats.clone()
@@ -651,6 +771,8 @@ mod native {
     #[link(name = "native_media_core")]
     unsafe extern "C" {
         static OH_MD_KEY_VIDEO_ENABLE_LOW_LATENCY: *const c_char;
+        static OH_MD_KEY_FRAME_RATE: *const c_char;
+        static OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR: *const c_char;
         fn OH_AVFormat_CreateVideoFormat(
             mime: *const c_char,
             width: i32,
@@ -984,6 +1106,16 @@ mod native {
                 code: -1,
             });
         }
+        // Video variable refresh rate: the platform follows the stream's own
+        // frame rate instead of the panel sitting at a rate this app guessed.
+        // Best effort on purpose -- the feature is platform-dependent and a
+        // platform without it must keep decoding normally rather than fail the
+        // session over a hint. The frame rate key is set first because the
+        // feature reads it.
+        unsafe {
+            OH_AVFormat_SetIntValue(format, OH_MD_KEY_FRAME_RATE, config.frame_rate as i32);
+            OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR, 1);
+        }
         let code = unsafe { OH_VideoDecoder_Configure(codec, format) };
         unsafe { OH_AVFormat_Destroy(format) };
         check("OH_VideoDecoder_Configure", code)?;
@@ -1120,7 +1252,22 @@ mod native {
                 }
                 Action::Submit(buffer, unit) => {
                     let result = push(codec, buffer, &unit, &shared);
-                    shared.submitted(unit.bytes.len(), result.is_ok());
+                    // Timed here because this is the last point where the unit
+                    // still exists: the worker's queue carries indices, not
+                    // payloads, so the arrival stamp cannot travel with it.
+                    let elapsed = unit
+                        .accepted_at
+                        .map(|at| at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+                    let queue = match (unit.accepted_at, unit.dequeued_at) {
+                        (Some(arrived), Some(dequeued)) => Some(
+                            dequeued
+                                .saturating_duration_since(arrived)
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        ),
+                        _ => None,
+                    };
+                    shared.submitted_at(unit.bytes.len(), result.is_ok(), elapsed, queue);
                     result
                 }
             };
@@ -1150,6 +1297,9 @@ mod tests {
             codec: VideoCodec::H265,
             width: 3840,
             height: 2160,
+            // The variable refresh rate hint reads this, so the test config
+            // carries a real rate rather than a zero.
+            frame_rate: 60,
             max_queued_units: 1,
             max_queued_bytes: 16,
         }
@@ -1159,6 +1309,10 @@ mod tests {
             bytes: vec![1, 2, 3],
             pts_us: 1,
             kind: AccessUnitKind::Frame { key: false },
+            // Unstamped: `submit` is what stamps a unit, exactly as on the real
+            // path.
+            accepted_at: None,
+            dequeued_at: None,
         }
     }
 
@@ -1254,6 +1408,8 @@ mod tests {
                 bytes: Vec::new(),
                 pts_us: 2,
                 kind: AccessUnitKind::EndOfStream,
+                accepted_at: None,
+                dequeued_at: None,
             })
             .unwrap();
         let rejected = shared.submit(packet()).unwrap_err();
