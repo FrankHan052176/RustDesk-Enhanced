@@ -117,8 +117,9 @@ jobs:
           set -euo pipefail
           har=native/ohos_har/package.har
           test -s "$har"
-          tar -tzf "$har" | grep -q 'libs/arm64-v8a/librustdesk_native_har.so'
-          tar -tzf "$har" | grep -q 'index.ets'
+          contents="$(tar -tzf "$har")"
+          grep -Fq 'libs/arm64-v8a/librustdesk_native_har.so' <<<"$contents"
+          grep -Fq 'index.ets' <<<"$contents"
           sha256sum "$har"
 
       - name: Cache the OHOS support libraries
