@@ -10,6 +10,30 @@ export function runtimePollGlesBufferProbe(): string { return native.runtimePoll
 export function runtimeStartNativeBufferProbe(): string { return native.runtimeStartNativeBufferProbe(); }
 export function runtimePollNativeBufferProbe(): string { return native.runtimePollNativeBufferProbe(); }
 
+/**
+ * Adopts the native XComponent that arrives with the Surface's `onLoad`.
+ *
+ * The ArkUI node route is closed on this platform: nothing `getFrameNodeById`
+ * returns is accepted as an XComponent, so the native peer the framework hands
+ * this module is held instead. Returns 0 once it is held.
+ */
+export function xcomponentAttach(context: object): number {
+  return native.xcomponentAttach(context);
+}
+
+/**
+ * Declares the rate the video Surface is produced at, through that component.
+ *
+ * Returns the platform's result code: 0 means the expectation was accepted.
+ */
+export function xcomponentSetFrameRateRangeNative(
+  expected: number,
+  min: number,
+  max: number,
+): number {
+  return native.xcomponentSetFrameRateRangeNative(expected, min, max);
+}
+
 // Explicitly enabled view-only host. Per-peer local approval and system screen
 // recording consent remain mandatory; no input/clipboard/audio/file support.
 export function engineHostStart(width: number, height: number, fps: number): string {
@@ -433,8 +457,10 @@ export function sessionSetCodecPreference(sessionId: string, codec: string): str
   return native.sessionSetCodecPreference(sessionId, codec);
 }
 
-export function sessionSetCommon(sessionId: string, key: string, value: string): void {
-  native.sessionSetCommon(sessionId, key, value);
+export function sessionSetCommon(sessionId: string, key: string, value: string): string {
+  // The native side reports whether the decision reached the session; dropping
+  // that made a lost key indistinguishable from an applied one.
+  return native.sessionSetCommon(sessionId, key, value);
 }
 
 export function sessionSetConfirmOverrideFile(sessionId: string, actId: number, fileNum: number, needOverride: boolean, remember: boolean, isUpload: boolean): string {

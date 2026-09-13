@@ -142,6 +142,38 @@ pub fn runtime_get_server_config() -> String {
     .to_string()
 }
 
+/// Persist the ID-server configuration the settings screen edits.
+///
+/// The values are the same client options the getter reads, and the wire key is
+/// stored verbatim because it is the exact `key` the original client sends.
+#[napi]
+pub fn runtime_set_server_config(config_json: String) -> String {
+    let parsed: Value = match serde_json::from_str(&config_json) {
+        Ok(value) => value,
+        Err(_) => return action(false, "服务器配置不是有效 JSON"),
+    };
+    let text = |name: &str| {
+        parsed
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    let custom = text("mode") == "custom";
+    Config::set_option(
+        "custom-rendezvous-server".into(),
+        if custom { text("idServer") } else { String::new() },
+    );
+    Config::set_option("relay-server".into(), text("relayServer"));
+    Config::set_option("api-server".into(), text("apiServer"));
+    Config::set_option("key".into(), text("key"));
+    let mut payload: Value =
+        serde_json::from_str(&runtime_get_server_config()).unwrap_or_else(|_| json!({}));
+    payload["ok"] = json!(true);
+    payload.to_string()
+}
+
 #[napi]
 pub fn runtime_start_account_login_options() -> String {
     action(
@@ -197,27 +229,3 @@ pub fn input_interceptor_poll_events(_limit: f64) -> String {
     json!({"ok": false, "message": UNSUPPORTED_MESSAGE, "events": []}).to_string()
 }
 
-#[napi]
-pub fn controlled_server_get_status() -> String {
-    json!({
-        "ok": true,
-        "state": "stopped",
-        "serverRunning": false,
-        "myId": Config::get_id(),
-        "temporaryPassword": "",
-        "lastError": "",
-        "message": "HarmonyOS host compatibility is not started"
-    })
-    .to_string()
-}
-
-#[napi]
-pub fn controlled_screen_capture_get_status() -> String {
-    json!({
-        "ok": true,
-        "state": "stopped",
-        "active": false,
-        "message": "Screen capture is not active"
-    })
-    .to_string()
-}

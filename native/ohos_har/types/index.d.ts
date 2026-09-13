@@ -12,6 +12,16 @@ export declare function runtimeStartNativeBufferProbe(): string
 export declare function runtimePollNativeBufferProbe(): string
 
 /** User-enabled view-only host; local approval + system recording consent required. */
+/**
+ * Adopts the native XComponent the Surface's `onLoad` hands over; 0 once held.
+ */
+export declare function xcomponentAttach(context: object): number
+/**
+ * Declares the rate the video Surface is produced at, as a platform result code.
+ *
+ * Zero means the expectation was accepted, -3 that no component was adopted yet.
+ */
+export declare function xcomponentSetFrameRateRangeNative(expected: number, min: number, max: number): number
 export declare function engineHostStart(width: number, height: number, fps: number): string
 export declare function engineHostSnapshot(id: string): string
 export declare function engineHostApprove(id: string, requestId: string, allow: boolean): boolean
@@ -227,7 +237,7 @@ export declare function sessionTakeClipboardImage(sessionId: string): Uint8Array
 
 export declare function sessionSetCodecPreference(sessionId: string, codec: string): string
 
-export declare function sessionSetCommon(sessionId: string, key: string, value: string): void
+export declare function sessionSetCommon(sessionId: string, key: string, value: string): string
 
 export declare function sessionSetConfirmOverrideFile(sessionId: string, actId: number, fileNum: number, needOverride: boolean, remember: boolean, isUpload: boolean): string
 

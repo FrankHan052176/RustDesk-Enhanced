@@ -1712,21 +1712,29 @@ pub fn session_toggle_option(session_id: String, option: String) {
 }
 
 #[napi]
-pub fn session_set_common(session_id: String, key: String, value: String) {
+pub fn session_set_common(session_id: String, key: String, value: String) -> String {
     let registry = lock(sessions());
     let Some(viewer) = registry
         .get(&session_id)
         .and_then(|session| session.viewer.as_ref())
     else {
-        return;
+        // Returned rather than swallowed: a key that never reaches the viewer
+        // leaves the session sitting in a phase only a frontend log would show,
+        // and the discard is what made that invisible.
+        return format!("common_unapplied key={key} reason=session_not_found");
     };
     if key == "continue-insecure-connection" {
         let allow = value.eq_ignore_ascii_case("Y");
-        let _ = viewer.continue_insecure(allow);
+        let outcome = viewer.continue_insecure(allow);
         if !allow {
             viewer.request_close();
         }
+        return match outcome {
+            Ok(()) => format!("common_applied key={key} allow={allow}"),
+            Err(error) => format!("common_unapplied key={key} reason={error}"),
+        };
     }
+    format!("common_ignored key={key}")
 }
 
 #[napi]
@@ -1780,20 +1788,29 @@ pub fn session_get_frame_rate_snapshot(session_id: String, _display: u32) -> Str
             "intentRevision": "0",
             "desiredFps": Value::Null,
             "safetyFpsCap": Value::Null,
-            "elapsedMs": "0",
-            "receivedPackets": "0",
-            "decodedFrames": "0",
-            "submittedFrames": "0",
-            "unavailableFrames": "0",
-            "noBufferFrames": "0",
-            "busyFrames": "0",
-            "decodeCalls": "0",
-            "decodeNs": "0",
-            "conversionCalls": "0",
-            "conversionNs": "0",
-            "targetCalls": "0",
-            "targetNs": "0",
-            "queueLen": "0",
+            // Same shape as the populated branch: a consumer that type-checks the
+            // counters must not see a different shape for a missing session.
+            "elapsedMs": 0,
+            "receivedPackets": 0,
+            "decodedFrames": 0,
+            "submittedFrames": 0,
+            "admittedUnits": 0,
+            "unavailableFrames": 0,
+            "noBufferFrames": 0,
+            "busyFrames": 0,
+            "decodeCalls": 0,
+            "decodeNs": 0,
+            "renderCalls": 0,
+            "renderNs": 0,
+            "renderPeakNs": 0,
+            "queueCalls": 0,
+            "queueNs": 0,
+            "queuedUnits": 0,
+            "conversionCalls": 0,
+            "conversionNs": 0,
+            "targetCalls": 0,
+            "targetNs": 0,
+            "queueLen": 0,
             "decodeCapacityFps": Value::Null,
             "status": "disabled",
             "recommendation": Value::Null,
@@ -1806,16 +1823,53 @@ pub fn session_get_frame_rate_snapshot(session_id: String, _display: u32) -> Str
     let intent_revision = session.intent_revision.to_string();
     let desired_fps = session.requested_fps.to_string();
     let snapshot = session.viewer.as_ref().map(|viewer| viewer.snapshot());
-    let (available, received, submitted, status) = match &snapshot {
+    let (available, received, admitted, presented, status) = match &snapshot {
         Some(snapshot) if !snapshot.closed => (
             true,
             snapshot.received_units,
-            // Units pushed into the decoder and frames actually presented are
-            // distinct counters; report the presented count as submitted.
             snapshot.pushed_units,
+            // Frames the decoder actually produced. Reporting admission as
+            // "submitted" showed the rate the decoder accepted work at, which is
+            // not the rate the viewer sees, and that is the number the panel is
+            // asked for.
+            snapshot.render_submissions,
             "observing",
         ),
-        _ => (false, 0, 0, "disabled"),
+        _ => (false, 0, 0, 0, "disabled"),
+    };
+    // Real elapsed time inside this process, from arrival to render submission.
+    // Reported as totals with the unit count, so the sampler divides rather than
+    // this side averaging over a window it does not own.
+    let (timed_units, pipeline_total_ns, pipeline_peak_ns) = match &snapshot {
+        Some(snapshot) => (
+            snapshot.timed_units,
+            snapshot.pipeline_micros_total.saturating_mul(1000),
+            snapshot.pipeline_micros_peak.saturating_mul(1000),
+        ),
+        None => (0, 0, 0),
+    };
+    // The arrival-to-on-screen path, which is what the panel's latency row is
+    // asked for. Kept separate from the submission-call figures above: those
+    // measure one SDK call, and reporting them as the path is what made the row
+    // read several times smaller than the wait an operator sees.
+    let (render_timed_units, render_total_ns, render_peak_ns) = match &snapshot {
+        Some(snapshot) => (
+            snapshot.render_timed_units,
+            snapshot.render_micros_total.saturating_mul(1000),
+            snapshot.render_micros_peak.saturating_mul(1000),
+        ),
+        None => (0, 0, 0),
+    };
+    // Queue wait, separated from the work. A device that cannot decode as fast
+    // as the peer sends spends its latency here, and a panel that reports this
+    // as decode time claims the hardware is slow when it is only behind.
+    let (queue_timed_units, queue_total_ns, queued_units) = match &snapshot {
+        Some(snapshot) => (
+            snapshot.queue_timed_units,
+            snapshot.queue_micros_total.saturating_mul(1000),
+            snapshot.queued_units,
+        ),
+        None => (0, 0, 0),
     };
     json!({
         "available": available,
@@ -1823,20 +1877,36 @@ pub fn session_get_frame_rate_snapshot(session_id: String, _display: u32) -> Str
         "intentRevision": intent_revision,
         "desiredFps": if available { Value::String(desired_fps) } else { Value::Null },
         "safetyFpsCap": Value::Null,
-        "elapsedMs": elapsed_ms.to_string(),
-        "receivedPackets": received.to_string(),
-        "decodedFrames": submitted.to_string(),
-        "submittedFrames": submitted.to_string(),
-        "unavailableFrames": "0",
-        "noBufferFrames": "0",
-        "busyFrames": "0",
-        "decodeCalls": "0",
-        "decodeNs": "0",
-        "conversionCalls": "0",
-        "conversionNs": "0",
-        "targetCalls": "0",
-        "targetNs": "0",
-        "queueLen": "0",
+        // Numbers, not strings. The consumer validates these as integers, and a
+        // decimal string is not one -- which rejected every sample and left the
+        // whole telemetry panel blank while the session was streaming happily.
+        "elapsedMs": elapsed_ms,
+        "receivedPackets": received,
+        // Wire arrivals per second: what the peer actually sent to this client.
+        // Distinct from `submittedFrames`, which counts what reached the screen.
+        "decodedFrames": received,
+        // Presented frames. The panel's FPS row reads this.
+        "submittedFrames": presented,
+        "admittedUnits": admitted,
+        "unavailableFrames": 0,
+        "noBufferFrames": 0,
+        "busyFrames": 0,
+        "decodeCalls": timed_units,
+        "decodeNs": pipeline_total_ns,
+        // Arrival to on-screen submission. The panel's latency row reads these;
+        // `decodeNs` above is the submission call and reads far smaller.
+        "renderCalls": render_timed_units,
+        "renderNs": render_total_ns,
+        "renderPeakNs": render_peak_ns,
+        "queueCalls": queue_timed_units,
+        "queueNs": queue_total_ns,
+        "queuedUnits": queued_units,
+        "conversionCalls": 0,
+        "conversionNs": 0,
+        // The peak is the number that describes a stutter; an average hides it.
+        "targetCalls": timed_units,
+        "targetNs": pipeline_peak_ns,
+        "queueLen": 0,
         "decodeCapacityFps": Value::Null,
         "status": status,
         "recommendation": Value::Null,

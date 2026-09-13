@@ -1,8 +1,10 @@
 //! Modern-only HAR. src/lib.rs is an uncompiled historical reference.
 //! No legacy application initialization, protocol implementation or pixel path.
 mod compat;
+mod controlled_host;
 mod host_bridge;
 mod session_compat;
+mod xcomponent;
 use librustdesk::{
     media_capability::{
         self, AdvertisedCodec, CapabilityError, CodecDirection, ScreenCaptureRateEvidence,
@@ -363,8 +365,7 @@ pub fn engine_connect_id(
         rendezvous_server,
         server_key,
         licence_key,
-        relay_server: None,
-        connect_timeout: std::time::Duration::from_secs(45),
+        relay_server: None,        connect_timeout: std::time::Duration::from_secs(45),
     };
     register_viewer(surface_id, options, move |options, lease| {
         Viewer::start_rendezvous(options, lease, config)
