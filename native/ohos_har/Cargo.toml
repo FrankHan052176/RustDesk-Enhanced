@@ -1,0 +1,35 @@
+[package]
+name = "rustdesk_native_har"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi-ohos = { version = "1.0", default-features = false, features = [
+    "napi8",
+    "async",
+] }
+napi-derive-ohos = { version = "1.0" }
+librustdesk = { package = "rustdesk", path = "../../crates/rd-engine" }
+hbb_common = { path = "../../libs/hbb_common" }
+serde_json = "1.0"
+zeroize = "1.8"
+
+[build-dependencies]
+napi-build-ohos = { version = "1.0" }
+
+# The crates.io build script does not recognize the OpenHarmony target triple.
+# Patch the shared wire crypto dependency's native build for this OHOS HAR.
+[patch.crates-io]
+libsodium-sys = { git = "https://github.com/FrankHan052176/sodiumoxide", rev = "a09de89d843f88a7bfccd80266150fe5d33e1eee" }
+
+[profile.release]
+lto = true

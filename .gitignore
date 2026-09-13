@@ -58,3 +58,12 @@ libsciter.dylib
 flutter/web/
 # libdrmtap is cloned at build time by build.py (not a submodule)
 /third_party/libdrmtap/
+
+# Enhanced runtime build and diagnostic output
+/artifacts/
+/dist/
+/logs/
+/native/ohos_har/dist/
+/native/ohos_har/package.har
+/native/ohos_har/package/libs/
+/native/ohos_har/target/

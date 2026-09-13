@@ -1,0 +1,144 @@
+name: HarmonyOS HAR
+
+# The HAR is the only native artifact consumed by the ArkTS application. The
+# support-library scripts are cache-aware and provision a fresh runner instead
+# of requiring a manually seeded cache.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/har.yml
+      - crates/rd-engine/**
+      - libs/**
+      - native/ohos_har/**
+      - scripts/ohos/**
+      - scripts/build-libvpx-ohos.sh
+      - scripts/build-libaom-ohos.sh
+      - scripts/build-libyuv-ohos.sh
+      - scripts/build-libopus-ohos.sh
+      - Cargo.toml
+      - Cargo.lock
+  pull_request:
+    paths:
+      - .github/workflows/har.yml
+      - crates/rd-engine/**
+      - libs/**
+      - native/ohos_har/**
+      - scripts/ohos/**
+      - scripts/build-libvpx-ohos.sh
+      - scripts/build-libaom-ohos.sh
+      - scripts/build-libyuv-ohos.sh
+      - scripts/build-libopus-ohos.sh
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  har:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      VCPKG_ROOT: ${{ github.workspace }}/target/ohos-vcpkg
+      CARGO_BUILD_JOBS: 2
+      RUSTDESK_OFFLINE_BUILD: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-ohos
+
+      # Provides the OHOS command line tools under $HOME/command-line-tools, which
+      # is one of the locations scripts/ohos/env.sh resolves the NDK from.
+      - name: HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2
+        with:
+          version: 6.1.1.280
+          cache: true
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake git make ninja-build perl curl
+
+      - name: Restore the OHOS support libraries
+        id: libs
+        uses: actions/cache/restore@v4
+        with:
+          path: target/ohos-vcpkg
+          key: ohos-vcpkg-${{ runner.os }}-${{ hashFiles('scripts/ohos/**', 'scripts/build-lib*ohos.sh', 'crates/rd-engine/Cargo.lock') }}
+          fail-on-cache-miss: false
+
+      - name: Build missing OHOS support libraries
+        run: |
+          bash scripts/build-libvpx-ohos.sh
+          bash scripts/build-libaom-ohos.sh
+          bash scripts/build-libyuv-ohos.sh
+          bash scripts/build-libopus-ohos.sh
+
+      - name: Require the OHOS support libraries
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT/installed/arm64-linux"
+          test -s "$prefix/lib/libvpx.a"
+          test -s "$prefix/lib/libaom.a"
+          test -s "$prefix/lib/libyuv.a"
+          test -s "$prefix/lib/libopus.a"
+
+      - name: Build the HAR
+        run: bash scripts/ohos/build-har.sh
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          har=native/ohos_har/package.har
+          test -s "$har"
+          tar -tzf "$har" | grep -q 'libs/arm64-v8a/librustdesk_native_har.so'
+          tar -tzf "$har" | grep -q 'index.ets'
+          sha256sum "$har"
+
+      - name: Cache the OHOS support libraries
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: target/ohos-vcpkg
+          key: ${{ steps.libs.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-ohrs
+          path: |
+            native/ohos_har/package.har
+            native/ohos_har/dist/arm64-v8a/librustdesk_native_har.so
+          if-no-files-found: error
+          retention-days: 14
+
+      # Publishing stays opt-in: a fork without the registry credentials still
+      # gets a green build and a downloadable artifact.
+      - name: Publish to the OHPM registry
+        if: ${{ github.event_name != 'pull_request' && secrets.OHPM_REGISTRY_AUTH != '' }}
+        env:
+          OHPM_REGISTRY_AUTH: ${{ secrets.OHPM_REGISTRY_AUTH }}
+        run: |
+          set -euo pipefail
+          cd native/ohos_har
+          "$HOME/command-line-tools/bin/ohpm" publish --no-interactive \
+            --registry "${OHPM_REGISTRY:?set the registry variable}" \
+            --auth "${OHPM_REGISTRY_AUTH}"

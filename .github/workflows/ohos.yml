@@ -2,7 +2,7 @@ name: OpenHarmony FFI
 
 on:
   push:
-    branches: [master]
+    branches: [master, integration/rustdesk4ohos]
   pull_request:
     branches: [master]
   workflow_dispatch:
