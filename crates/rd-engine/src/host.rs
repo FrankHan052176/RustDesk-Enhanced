@@ -192,6 +192,12 @@ impl Host {
             return Err(HostError::InvalidOptions);
         }
         sodiumoxide::init().map_err(|_| HostError::InvalidOptions)?;
+        // The one-time password is minted when the host starts, so the operator
+        // can read it -- and rotate it from the UI -- before anyone connects.
+        // Minting it inside the first login instead handed that client a
+        // challenge it had no way to answer, and left the screen saying
+        // "waiting to be generated" for as long as nobody connected.
+        password_security::update_temporary_password();
         let runtime = crate::executor::runtime().map_err(|_| HostError::NoRuntime)?;
         let state = Arc::new(State {
             cancel: CancellationToken::new(),
@@ -582,8 +588,8 @@ async fn authenticate(
     // clipboard stay denied unconditionally.
     let local_permissions = local_permissions(options);
     // The one-time password is plaintext in memory, so this session's salt is the
-    // one a client's first hash is built against. Generate one when the operator
-    // has none, exactly as the original host does at startup.
+    // one a client's first hash is built against. `Host::start` mints it, so this
+    // is only the fallback for a host whose password was cleared while running.
     if password_security::temporary_password().is_empty() {
         password_security::update_temporary_password();
     }

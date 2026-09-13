@@ -106,8 +106,10 @@ fn status_payload(snapshot: Option<&Value>) -> Value {
         "state": if running { "ready" } else { "disabled" },
         "serverRunning": running,
         "myId": identity_id(),
-        // This host authorizes a local click, so it has no password to hand out.
-        "temporaryPassword": "",
+        // Minted by `Host::start`, so the screen can show it before anyone
+        // connects. With the click-only policy it is still the password a
+        // client may be asked for once the operator switches modes.
+        "temporaryPassword": password_security::temporary_password(),
         "clientCount": if connected { 1 } else { 0 },
         // The engine records a session's outcome in the same field it uses for a
         // host fault, and the listener keeps serving after a denied or failed
