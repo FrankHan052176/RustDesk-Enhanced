@@ -53,6 +53,7 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/target/ohos-vcpkg
       CARGO_BUILD_JOBS: 2
       RUSTDESK_OFFLINE_BUILD: "0"
+      OHPM_REGISTRY_AUTH: ${{ secrets.OHPM_REGISTRY_AUTH }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -133,9 +134,7 @@ jobs:
       # Publishing stays opt-in: a fork without the registry credentials still
       # gets a green build and a downloadable artifact.
       - name: Publish to the OHPM registry
-        if: ${{ github.event_name != 'pull_request' && secrets.OHPM_REGISTRY_AUTH != '' }}
-        env:
-          OHPM_REGISTRY_AUTH: ${{ secrets.OHPM_REGISTRY_AUTH }}
+        if: ${{ github.event_name != 'pull_request' && env.OHPM_REGISTRY_AUTH != '' }}
         run: |
           set -euo pipefail
           cd native/ohos_har
