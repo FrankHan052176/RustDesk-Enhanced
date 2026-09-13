@@ -819,6 +819,20 @@ mod tests {
             }
             assert_eq!(shared[0], 1, "the client sends a shared-flag ClientInit");
             write_server_init(&mut stream, 4, 3, "ordered");
+            // `initialise` completes only after both preference messages are
+            // written. Drain them before closing so Windows sends FIN instead
+            // of aborting the client's still-in-progress `write_all`.
+            let mut set_format = [0u8; 20];
+            if !read_or_eof(&mut stream, &mut set_format) {
+                return;
+            }
+            assert_eq!(set_format[0], protocol::C2S_SET_PIXEL_FORMAT);
+            let mut set_encodings = [0u8; 8];
+            if !read_or_eof(&mut stream, &mut set_encodings) {
+                return;
+            }
+            assert_eq!(set_encodings[0], protocol::C2S_SET_ENCODINGS);
+            assert_eq!(u16::from_be_bytes([set_encodings[2], set_encodings[3]]), 1);
         });
         let (host, port) = address.rsplit_once(':').expect("host:port");
         let session =
