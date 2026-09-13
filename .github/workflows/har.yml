@@ -68,7 +68,9 @@ jobs:
           targets: aarch64-unknown-linux-ohos
 
       - name: Install HAR packager
-        run: cargo install ohrs --version "$OHRS_VERSION" --locked
+        run: |
+          cargo install ohrs --version "$OHRS_VERSION" --locked
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       # Provides the OHOS command line tools under $HOME/command-line-tools, which
       # is one of the locations scripts/ohos/env.sh resolves the NDK from.

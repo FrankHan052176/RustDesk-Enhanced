@@ -1865,7 +1865,6 @@ pub fn remove_trusted_devices(hwids: Vec<Bytes>) {
     allow_err!(set_data(&Data::RemoveTrustedDevices(hwids)));
 }
 
-#[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub fn clear_trusted_devices() {
     Config::clear_trusted_devices();
