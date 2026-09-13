@@ -1,0 +1,135 @@
+name: HarmonyOS HAR
+
+# The HAR is the only artifact the ArkTS app consumes, so this job builds it from
+# source and uploads exactly what a release would install.
+#
+# The build needs the OHOS SDK/NDK and the cross-compiled support libraries the
+# engine links against (libvpx/aom/yuv/opus), which `scripts/ohos/env.sh` expects
+# under `target/ohos-vcpkg/installed/arm64-linux`. Those libraries are provisioned
+# once and cached here; this workflow fails early with the missing piece named
+# rather than building against the wrong libc.
+#
+# STILL TO COMMIT: the vcpkg triplet and dependency manifest that produce
+# `target/ohos-vcpkg`. Until they are in the repository, the cache must be seeded
+# by a manual `workflow_dispatch` run on a machine that has them, or by uploading
+# the tree as an artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - .github/workflows/har.yml
+      - crates/rd-engine/**
+      - libs/**
+      - native/ohos_har/**
+      - scripts/ohos/**
+      - Cargo.toml
+      - Cargo.lock
+  pull_request:
+    paths:
+      - .github/workflows/har.yml
+      - crates/rd-engine/**
+      - libs/**
+      - native/ohos_har/**
+      - scripts/ohos/**
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  har:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      VCPKG_ROOT: ${{ github.workspace }}/target/ohos-vcpkg
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-ohos
+
+      # Provides the OHOS command line tools under $HOME/command-line-tools, which
+      # is one of the locations scripts/ohos/env.sh resolves the NDK from.
+      - name: HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2
+        with:
+          version: 6.1.1.280
+          cache: true
+
+      - name: Restore the OHOS support libraries
+        id: libs
+        uses: actions/cache/restore@v4
+        with:
+          path: target/ohos-vcpkg
+          key: ohos-vcpkg-${{ runner.os }}-${{ hashFiles('scripts/ohos/**', 'Cargo.lock') }}
+          fail-on-cache-miss: false
+
+      - name: Require the OHOS support libraries
+        run: |
+          set -euo pipefail
+          prefix="$VCPKG_ROOT/installed/arm64-linux"
+          if [[ ! -d "$prefix" ]]; then
+            echo "Missing $prefix." >&2
+            echo "The OHOS support libraries are not committed yet; see the header of this workflow." >&2
+            exit 1
+          fi
+
+      - name: Build the HAR
+        run: bash scripts/ohos/build-har.sh
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          har=native/ohos_har/package.har
+          test -s "$har"
+          tar -tzf "$har" | grep -q 'libs/arm64-v8a/librustdesk_native_har.so'
+          tar -tzf "$har" | grep -q 'index.ets'
+          sha256sum "$har"
+
+      - name: Cache the OHOS support libraries
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: target/ohos-vcpkg
+          key: ${{ steps.libs.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-ohrs
+          path: |
+            native/ohos_har/package.har
+            native/ohos_har/dist/arm64-v8a/librustdesk_native_har.so
+          if-no-files-found: error
+          retention-days: 14
+
+      # Publishing stays opt-in: a fork without the registry credentials still
+      # gets a green build and a downloadable artifact.
+      - name: Publish to the OHPM registry
+        if: ${{ github.event_name != 'pull_request' && secrets.OHPM_REGISTRY_AUTH != '' }}
+        env:
+          OHPM_REGISTRY_AUTH: ${{ secrets.OHPM_REGISTRY_AUTH }}
+        run: |
+          set -euo pipefail
+          cd native/ohos_har
+          "$HOME/command-line-tools/bin/ohpm" publish --no-interactive \
+            --registry "${OHPM_REGISTRY:?set the registry variable}" \
+            --auth "${OHPM_REGISTRY_AUTH}"
